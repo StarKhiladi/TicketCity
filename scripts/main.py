@@ -9,7 +9,7 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from google.cloud import bigquery
 import re
@@ -23,7 +23,26 @@ TRAJECTORIES_DIR = Path("data/trajectories")
 TRAJECTORIES_DIR.mkdir(parents=True, exist_ok=True)
 Path("data").mkdir(exist_ok=True)
 
-PARTITION = "2026-04-03"
+def _get_vivid_partition() -> str:
+    """Return the most recent loaded VividIntake partition date (YYYY-MM-DD).
+    Uses a free INFORMATION_SCHEMA metadata query — no table scan."""
+    result = client.query("""
+        SELECT partition_id
+        FROM `data-ticketcity.VividIntake.INFORMATION_SCHEMA.PARTITIONS`
+        WHERE table_name = 'Events'
+          AND partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')
+        ORDER BY partition_id DESC
+        LIMIT 1
+    """).result()
+    row = next(iter(result), None)
+    if row:
+        pid = str(row[0])
+        return f"{pid[:4]}-{pid[4:6]}-{pid[6:8]}"
+    # Fallback: yesterday in case today's partition isn't loaded yet
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%d')
+
+PARTITION = _get_vivid_partition()
 
 # ================================================================== #
 #  CATEGORY ROUTING                                                    #
@@ -216,12 +235,67 @@ def parse_event_date(date_str):
             continue
     return None
 
+def safe_sql_str(s: str) -> str:
+    """
+    Escape a Python string for safe use inside a BigQuery SQL string literal.
+    """
+    return str(s or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def classify_ticket_class(section_name: str, row_name: str = "") -> str:
+    """
+    Broad ticket class required for deliverable segmentation.
+    Returns GA or RESERVED.
+    """
+    s = f"{section_name or ''} {row_name or ''}".upper()
+
+
+    ga_terms = [
+    "GA", "GENERAL ADMISSION", "STANDING", "LAWN", "SRO"
+]
+    if any(term in s for term in ga_terms):
+        return "GA"
+    return "RESERVED"
+
+
+def pct_change_safe(old_val, new_val):
+    """
+    Safe percent change helper.
+    """
+    if old_val is None or pd.isna(old_val) or old_val == 0:
+        return np.nan
+    if new_val is None or pd.isna(new_val):
+        return np.nan
+    return (new_val - old_val) / old_val * 100.0
+
+
+def classify_market_behavior(
+    price_change_14d: float,
+    ticket_change_14d: float,
+    listing_change_14d: float,
+) -> str:
+    """
+    Label a section based on recent supply + price movement.
+    """
+    if pd.notna(price_change_14d) and pd.notna(ticket_change_14d):
+        # Prices falling while supply barely clears = decay risk
+        if price_change_14d <= -10 and ticket_change_14d >= -5:
+            return "DECAY_RISK"
+
+        # Price stable/rising while supply clears = reliable sell-through
+        if price_change_14d >= 0 and ticket_change_14d <= -15:
+            return "RELIABLE"
+
+    if pd.notna(price_change_14d) and pd.notna(listing_change_14d):
+        if price_change_14d <= -8 and listing_change_14d >= -5:
+            return "DECAY_RISK"
+
+    return "BALANCED"
 
 # ================================================================== #
 #  STEP 1: EVENT INFO                                                  #
 # ================================================================== #
 def get_event_info(event_id: int) -> dict:
-    """Single query — pulls event + performers + category + venue."""
     query = f"""
     SELECT
         e.EventID,
@@ -244,21 +318,23 @@ def get_event_info(event_id: int) -> dict:
     FROM `data-ticketcity.VividIntake.Events` e
     LEFT JOIN `data-ticketcity.VividIntake.EventPerformers` ep
         ON e.EventID = ep.Event_ID
-        AND ep._PARTITIONTIME = e._PARTITIONTIME
+        AND DATE(ep._PARTITIONTIME) = DATE(e._PARTITIONTIME)
     LEFT JOIN `data-ticketcity.VividIntake.Performers` p
         ON ep.Performer_ID = p.Performer_ID
-        AND p._PARTITIONTIME = e._PARTITIONTIME
+        AND DATE(p._PARTITIONTIME) = DATE(e._PARTITIONTIME)
     LEFT JOIN `data-ticketcity.VividIntake.Categories` c
         ON e.CategoryID = c.Category_ID
-        AND c._PARTITIONTIME = e._PARTITIONTIME
+        AND DATE(c._PARTITIONTIME) = DATE(e._PARTITIONTIME)
     LEFT JOIN `data-ticketcity.VividIntake.Venues` v
         ON e.VenueID = v.Venue_ID
-        AND v._PARTITIONTIME = e._PARTITIONTIME
+        AND DATE(v._PARTITIONTIME) = DATE(e._PARTITIONTIME)
     WHERE e.EventID = {event_id}
+      AND DATE(e._PARTITIONTIME) = DATE("{PARTITION}")
     ORDER BY e._PARTITIONTIME DESC
     LIMIT 20
     """
     df = client.query(query).to_dataframe()
+
     if df.empty:
         return None
 
@@ -270,19 +346,19 @@ def get_event_info(event_id: int) -> dict:
     )
 
     return {
-        'EventID':       int(event_id),
-        'Name':          str(row['Name'] or ''),
-        'LocalDate':     str(row['LocalDate'] or ''),
-        'VenueID':       int(row['VenueID'] or 0),
-        'Venue_Name':    str(row['Venue_Name'] or ''),
-        'City':          str(row['City'] or ''),
-        'State':         str(row['State'] or ''),
-        'EventType':     str(row['EventType'] or ''),
-        'TicketCount':   int(row['TicketCount'] or 0),
-        'ListingCount':  int(row['ListingCount'] or 0),
-        'MinPrice':      float(row['MinPrice'] or 0),
-        'MaxPrice':      float(row['MaxPrice'] or 0),
-        'CategoryID':    int(row['CategoryID'] or 0),
+        'EventID': int(event_id),
+        'Name': str(row['Name'] or ''),
+        'LocalDate': str(row['LocalDate'] or ''),
+        'VenueID': int(row['VenueID'] or 0),
+        'Venue_Name': str(row['Venue_Name'] or ''),
+        'City': str(row['City'] or ''),
+        'State': str(row['State'] or ''),
+        'EventType': str(row['EventType'] or ''),
+        'TicketCount': int(row['TicketCount'] or 0),
+        'ListingCount': int(row['ListingCount'] or 0),
+        'MinPrice': float(row['MinPrice'] or 0),
+        'MaxPrice': float(row['MaxPrice'] or 0),
+        'CategoryID': int(row['CategoryID'] or 0),
         'Category_Name': str(row['Category_Name'] or ''),
         'performers_df': performers_df,
     }
@@ -1264,7 +1340,9 @@ def generate_recommendation(
     curves: pd.DataFrame,
     current_price: float,
     days_before_event: int,
+    prior_price: float = None,
     cost_basis: float = None,
+    mode: str = None,
 ) -> dict:
 
     traj = fit_trajectory(curves)
@@ -1274,6 +1352,12 @@ def generate_recommendation(
             'reasoning': 'Not enough historical comp data.',
             'predictions': {}
         }
+    
+    # Sports fans routinely buy within the final week — a 30-40% day-of
+    # price drop is normal demand behavior, not a distress signal.
+    # Use a looser threshold for sports to avoid false SELL_NOW triggers.
+    is_sports = mode in ('sports',) if mode else False
+    day0_decay_threshold = -30 if is_sports else -20
 
     current_row   = get_nearest_row(traj, days_before_event)
     current_index = float(current_row['price_index_smooth'])
@@ -1299,6 +1383,16 @@ def generate_recommendation(
     upside_pct   = ((peak_price   - current_price) / current_price) * 100
     downside_pct = ((trough_price - current_price) / current_price) * 100
     day0_pct     = ((day0_price   - current_price) / current_price) * 100
+
+    # Realized decline since the prior checkpoint.
+    # The model recalibrates its baseline from current price each call, so
+    # it can't see a sustained decline on its own — prior_price provides
+    # that anchor.
+    realized_decline_pct = 0.0
+    if prior_price and prior_price > 0:
+        realized_decline_pct = (
+            (current_price - prior_price) / prior_price * 100
+        )
 
     avg_band     = float(
         (curves['p75_price_index'] - curves['p25_price_index']).mean()
@@ -1339,47 +1433,89 @@ def generate_recommendation(
             'day0_profit_abs':     round(day0_price - cost_basis, 2),
         }
 
-    # Decision
-    # Late window override
-    # Final 14 days: ticket prices often surge from last-minute buyers
-    # Only recommend SELL_NOW if decay is severe and well-supported
-    if days_before_event <= 14:
-        if day0_pct < -20 and max_support >= 10:
-            rec = 'SELL_NOW'
-            reasoning = (
-                f"Strong decay signal in final 2 weeks — "
-                f"comps show ~${day0_price:.0f} at event day "
-                f"({day0_pct:.1f}%). {support_note}"
-            )
-        else:
-            rec = 'MONITOR'
-            reasoning = (
-                f"Within 14 days — prices volatile. "
-                f"Comps suggest ~${day0_price:.0f} at event day "
-                f"({day0_pct:.1f}% vs now). "
-                f"Check daily and sell if price spikes. "
-                f"{support_note}"
-            )
+    # ── Decision logic ──────────────────────────────────────────────── #
+
+    # [1] Realized decline stop-loss — fires before any HOLD check.
+    # The tautological baseline (baseline = current_price / current_index)
+    # means the model re-anchors at every checkpoint and can keep seeing
+    # "upside" even as prices spiral down. prior_price breaks that loop.
+    # Requires BOTH:
+    #   a) actual price has dropped ≥20% from the day-90 anchor, AND
+    #   b) the comp trajectory also predicts a bad endpoint (day0_pct < -10)
+    # The second condition filters out temporary dips where the trajectory
+    # still correctly predicts recovery — in those cases the decline is noise,
+    # not a signal. Without it, V-shaped events get sold at the trough.
+    if realized_decline_pct <= -20 and day0_pct < -10 and upside_pct < 30 \
+            and max_support >= 5:
+        rec = 'SELL_NOW'
+        reasoning = (
+            f"Price has dropped {realized_decline_pct:.1f}% since last "
+            f"evaluation (${prior_price:.0f} → ${current_price:.0f}). "
+            f"Actual trajectory is underperforming comp predictions — "
+            f"sell now rather than wait for further decay. "
+            f"{support_note}{uncertainty}"
+        )
         return {
-            'recommendation':   rec,
-            'reasoning':        reasoning,
-            'current_price':    round(current_price, 2),
-            'baseline_price':   round(baseline, 2),
-            'days_remaining':   days_before_event,
-            'peak_price':       round(peak_price, 2),
-            'peak_day':         peak_day,
-            'trough_price':     round(trough_price, 2),
-            'day0_price':       round(day0_price, 2),
-            'upside_pct':       round(upside_pct, 1),
-            'downside_pct':     round(downside_pct, 1),
-            'day0_pct':         round(day0_pct, 1),
-            'predictions':      predictions,
+            'recommendation':      rec,
+            'reasoning':           reasoning,
+            'current_price':       round(current_price, 2),
+            'baseline_price':      round(baseline, 2),
+            'days_remaining':      days_before_event,
+            'peak_price':          round(peak_price, 2),
+            'peak_day':            peak_day,
+            'trough_price':        round(trough_price, 2),
+            'day0_price':          round(day0_price, 2),
+            'upside_pct':          round(upside_pct, 1),
+            'downside_pct':        round(downside_pct, 1),
+            'day0_pct':            round(day0_pct, 1),
+            'realized_decline_pct': round(realized_decline_pct, 1),
+            'predictions':         predictions,
             **pnl,
         }
-    
-    # Decision variables
+
+    # [2] Late-window override — within 14 days default to SELL_NOW.
+    # MONITOR at day 14 with no forced sell = silent day-0 sell at a
+    # typically lower price. Only hold if there's strong spike evidence.
+    if days_before_event <= 14:
+        if upside_pct >= 20 and day0_pct > -5 and max_support >= 5:
+            rec = 'HOLD'
+            reasoning = (
+                f"Strong late-window spike — comps show "
+                f"{upside_pct:.1f}% appreciation to ${peak_price:.0f} "
+                f"near event day. {support_note}"
+            )
+        else:
+            rec = 'SELL_NOW'
+            reasoning = (
+                f"Within 14 days — sell now. Comps suggest "
+                f"~${day0_price:.0f} at event day "
+                f"({day0_pct:.1f}% vs current ${current_price:.0f}). "
+                f"Holding this late risks illiquidity and further decay. "
+                f"{support_note}{uncertainty}"
+            )
+        return {
+            'recommendation':      rec,
+            'reasoning':           reasoning,
+            'current_price':       round(current_price, 2),
+            'baseline_price':      round(baseline, 2),
+            'days_remaining':      days_before_event,
+            'peak_price':          round(peak_price, 2),
+            'peak_day':            peak_day,
+            'trough_price':        round(trough_price, 2),
+            'day0_price':          round(day0_price, 2),
+            'upside_pct':          round(upside_pct, 1),
+            'downside_pct':        round(downside_pct, 1),
+            'day0_pct':            round(day0_pct, 1),
+            'realized_decline_pct': round(realized_decline_pct, 1),
+            'predictions':         predictions,
+            **pnl,
+        }
+
+    # Decision variables (days > 14)
     risk_reward  = abs(downside_pct) / max(upside_pct, 0.1)
-    poor_rr      = risk_reward > 3.0 and downside_pct < -20
+    # Loosened from ratio > 3.0 / downside < -20 — previous thresholds
+    # were too strict and let many deteriorating events slip through.
+    poor_rr      = risk_reward > 2.0 and downside_pct < -15
     hold_days    = days_before_event - peak_day
 
     timing_note  = (
@@ -1387,7 +1523,7 @@ def generate_recommendation(
         if hold_days <= 21 else ""
     )
 
-    if poor_rr and upside_pct < 20:
+    if poor_rr:
         rec = 'SELL_NOW'
         reasoning = (
             f"Unfavorable risk/reward — upside of "
@@ -1396,7 +1532,7 @@ def generate_recommendation(
             f"${day0_price:.0f} at event day. "
             f"{support_note}{uncertainty}"
         )
-    elif upside_pct >= 8 and peak_day > 7:
+    elif upside_pct >= 10 and peak_day > 7:
         rec = 'HOLD'
         reasoning = (
             f"Price trajectory shows appreciation to ${peak_price:.0f} "
@@ -1410,6 +1546,15 @@ def generate_recommendation(
             f"at {peak_day} days out. Downside {downside_pct:.1f}%. "
             f"{support_note}{uncertainty}{timing_note}"
         )
+    elif day0_pct < day0_decay_threshold:
+        # Severe endpoint decay overrides any mid-trajectory peak.
+        rec = 'SELL_NOW'
+        reasoning = (
+            f"Comps show severe price decay to ~${day0_price:.0f} by "
+            f"event day ({day0_pct:.1f}% vs now). "
+            f"Mid-trajectory peak of ${peak_price:.0f} doesn't compensate "
+            f"for the risk of missing it. {support_note}{uncertainty}"
+        )
     elif downside_pct < -15 and upside_pct < 5 and day0_pct < -10:
         rec = 'SELL_NOW'
         reasoning = (
@@ -1419,13 +1564,22 @@ def generate_recommendation(
             f"{support_note}{uncertainty}"
         )
     elif abs(upside_pct) < 5 and abs(downside_pct) < 10:
-        rec = 'MONITOR'
-        reasoning = (
-            f"Flat trajectory. Upside {upside_pct:.1f}%, "
-            f"downside {downside_pct:.1f}%. No urgency. "
-            f"Re-evaluate in 14 days. {support_note}{uncertainty}"
-        )
-    elif day0_pct < -15 and upside_pct < 10:
+        if realized_decline_pct <= -12:
+            rec = 'SELL_NOW'
+            reasoning = (
+                f"Comp trajectory appears flat but actual price has "
+                f"declined {realized_decline_pct:.1f}% since day-90. "
+                f"Selling into observed weakness rather than waiting. "
+                f"{support_note}{uncertainty}"
+            )
+        else:
+            rec = 'MONITOR'
+            reasoning = (
+                f"Flat trajectory. Upside {upside_pct:.1f}%, "
+                f"downside {downside_pct:.1f}%. No urgency. "
+                f"Re-evaluate in 14 days. {support_note}{uncertainty}"
+            )
+    elif day0_pct < -15 and upside_pct < 15:
         rec = 'SELL_NOW'
         reasoning = (
             f"Comps show price decays to ~${day0_price:.0f} by event day "
@@ -1433,27 +1587,37 @@ def generate_recommendation(
             f"{support_note}{uncertainty}"
         )
     else:
-        rec = 'MONITOR'
-        reasoning = (
-            f"Mixed signals — upside {upside_pct:.1f}%, "
-            f"downside {downside_pct:.1f}%. "
-            f"Review in 21 days. {support_note}{uncertainty}"
-        )
+        if realized_decline_pct <= -12:
+            rec = 'SELL_NOW'
+            reasoning = (
+                f"Mixed comp signals but actual price has declined "
+                f"{realized_decline_pct:.1f}% since day-90. "
+                f"Observed price path takes precedence. "
+                f"{support_note}{uncertainty}"
+            )
+        else:
+            rec = 'MONITOR'
+            reasoning = (
+                f"Mixed signals — upside {upside_pct:.1f}%, "
+                f"downside {downside_pct:.1f}%. "
+                f"Review in 21 days. {support_note}{uncertainty}"
+            )
 
     return {
-        'recommendation':   rec,
-        'reasoning':        reasoning,
-        'current_price':    round(current_price, 2),
-        'baseline_price':   round(baseline, 2),
-        'days_remaining':   days_before_event,
-        'peak_price':       round(peak_price, 2),
-        'peak_day':         peak_day,
-        'trough_price':     round(trough_price, 2),
-        'day0_price':       round(day0_price, 2),
-        'upside_pct':       round(upside_pct, 1),
-        'downside_pct':     round(downside_pct, 1),
-        'day0_pct':         round(day0_pct, 1),
-        'predictions':      predictions,
+        'recommendation':       rec,
+        'reasoning':            reasoning,
+        'current_price':        round(current_price, 2),
+        'baseline_price':       round(baseline, 2),
+        'days_remaining':       days_before_event,
+        'peak_price':           round(peak_price, 2),
+        'peak_day':             peak_day,
+        'trough_price':         round(trough_price, 2),
+        'day0_price':           round(day0_price, 2),
+        'upside_pct':           round(upside_pct, 1),
+        'downside_pct':         round(downside_pct, 1),
+        'day0_pct':             round(day0_pct, 1),
+        'realized_decline_pct': round(realized_decline_pct, 1),
+        'predictions':          predictions,
         **pnl,
     }
 
@@ -1465,7 +1629,9 @@ def print_report(info: dict, comps: pd.DataFrame,
                  confidence: str, market: dict, rec: dict,
                  tc_share: dict = None,
                  demand: dict = None,
-                 st_summary: dict = None):
+                 st_summary: dict = None,
+                 decay: dict = None,
+                 section: dict = None):
 
     print(f"\n{'='*65}")
     print(f"  TICKETCITY ANALYSIS REPORT")
@@ -1488,16 +1654,103 @@ def print_report(info: dict, comps: pd.DataFrame,
               f"{market['report_date']})")
         print(f"  Orders on that date:    {market['orders']}")
 
-    print(f"\n🔍 COMP ANALYSIS")
-    print(f"  Confidence:    {confidence}")
-    print(f"  Comps used:    {len(comps)}")
-    if not comps.empty:
-        print(f"  Top 3 comps:")
-        for _, row in comps.head(3).iterrows():
-            print(f"    • {str(row['Name'])[:50]:<50} "
-                  f"| {str(row['EventDate'])[:16]} "
-                  f"| ${row['avg_order_size']:.0f} avg "
-                  f"| {int(row['total_orders'])} orders")
+    CATEGORY_RISK = {
+        'Comedy':          'HIGH — comp pools unreliable, trajectory highly variable',
+        'NCAA Basketball': 'HIGH — demand spikes near game day not captured by comps',
+        'Rock':            'MEDIUM-HIGH — artist-specific demand not reflected in genre comps',
+        'Pop':             'MEDIUM-HIGH — outlier events skew comp trajectories',
+        'MLB Baseball':    'MEDIUM — flat decay curves, low comp differentiation',
+    }
+    cat_risk = CATEGORY_RISK.get(info['Category_Name'], 'STANDARD')
+    print(f"\n⚠️  CATEGORY RISK: {cat_risk}")
+
+    if st_summary:
+        print(f"\n📉 SELL-THROUGH PATTERN (from {st_summary['n_events']} comps)")
+        print(f"  Early (60+ days):  {st_summary['median_early_pct']}% of sales")
+        print(f"  Mid (14-60 days):  {st_summary['median_mid_pct']}% of sales")
+        print(f"  Late (0-14 days):  {st_summary['median_late_pct']}% of sales")
+        print(f"  Typical peak day:  "
+              f"{st_summary['typical_peak_day']:.0f} days before event")
+        
+    if decay:
+        decay_icons = {"RELIABLE": "🟢", "MODERATE": "🟡", "HIGH_DECAY": "🔴", "UNKNOWN": "⚪"}
+        flag_icons  = {
+            "SELL_EARLY_REQUIRED": "🔴", "HOLD_THROUGH_PEAK": "🟢",
+            "SELL_ANYTIME": "🟡",        "LAST_MINUTE_DEMAND": "🟠", "UNKNOWN": "⚪"
+        }
+        d_icon = decay_icons.get(decay["decay_class"], "⚪")
+        f_icon = flag_icons.get(decay["timing_flag"], "⚪")
+        print(f"\n{d_icon} DECAY PROFILE:  {decay['decay_class']}  "
+              f"(median decay {decay.get('med_decay_pct', 0):+.1f}%  "
+              f"| early sell {decay.get('med_early_pct', 0):.0f}%  "
+              f"| late sell {decay.get('med_late_pct', 0):.0f}%)")
+        print(f"{f_icon} TIMING FLAG:    {decay['timing_flag']}")
+        print(f"   {decay['guidance']}")
+
+        # ── Section & Market Dynamics ────────────────────────────────
+    if section:
+        print(f"\n🏟️ SECTION & MARKET DYNAMICS")
+        print(f"  Snapshot days analyzed: {section.get('snapshot_days', 0)}")
+        print(f"  Marketplace sources:    {section.get('source_count', 0)}")
+
+        ga_tbl = section.get("ga_vs_reserved")
+        if isinstance(ga_tbl, pd.DataFrame) and not ga_tbl.empty:
+            print(f"\n  GA VS RESERVED")
+            for _, row in ga_tbl.iterrows():
+                print(
+                    f"   {row['segment']:<12} | "
+                    f"Listings: {int(row['n_listings']):>5} | "
+                    f"Tickets: {int(row['total_tickets']):>5} | "
+                    f"Median: ${float(row['median_price']):.2f}"
+                )
+
+        scarcity = section.get("scarcity_leaders")
+        if isinstance(scarcity, pd.DataFrame) and not scarcity.empty:
+            print(f"\n  TIGHTEST SUPPLY SECTIONS")
+            for _, row in scarcity.head(3).iterrows():
+                print(
+                    f"   {row['section_group']} ({row['ticket_class']}) | "
+                    f"Tickets: {int(row['latest_ticket_count'])} | "
+                    f"Median: ${float(row['latest_median_price']):.2f} | "
+                    f"Flag: {row['behavior_flag']}"
+                )
+
+        decay_tbl = section.get("decay_sections")
+        if isinstance(decay_tbl, pd.DataFrame) and not decay_tbl.empty:
+            print(f"\n  HIGHEST DECAY-RISK SECTIONS")
+            for _, row in decay_tbl.head(3).iterrows():
+                price_chg = row['price_change_14d_pct']
+                print(
+                    f"   {row['section_group']} ({row['ticket_class']}) | "
+                    f"14d price: {price_chg:+.1f}% | "
+                    f"Tickets: {int(row['latest_ticket_count'])}"
+                )
+
+        tc_tbl = section.get("tc_position_latest")
+        if isinstance(tc_tbl, pd.DataFrame) and not tc_tbl.empty:
+            print(f"\n  TICKETCITY SHARE BY SECTION")
+            for _, row in tc_tbl.head(3).iterrows():
+                print(
+                    f"   {row['section_group']} ({row['ticket_class']}) | "
+                    f"TC ticket share: {float(row['tc_ticket_share']):.1f}% | "
+                    f"TC listing share: {float(row['tc_listing_share']):.1f}%"
+                )
+        
+        source_tbl = section.get("source_summary")
+        if isinstance(source_tbl, pd.DataFrame) and not source_tbl.empty:
+            print(f"\n  MARKETPLACE BREAKDOWN")
+            latest_source_date = source_tbl["snapshot_date"].max()
+            latest_sources = (
+                source_tbl[source_tbl["snapshot_date"] == latest_source_date]
+                .sort_values("listing_count", ascending=False)
+            )
+            for _, row in latest_sources.head(5).iterrows():
+                print(
+                    f"   {str(row['DataSource']):<18} | "
+                    f"Listings: {int(row['listing_count']):>5} | "
+                    f"Tickets: {int(row['ticket_count']):>5} | "
+                    f"Median: ${float(row['median_price']):.2f}"
+                )
 
     print(f"\n📈 PRICE PREDICTIONS")
     print(f"  Baseline price: ${rec['baseline_price']}")
@@ -1557,6 +1810,545 @@ def print_report(info: dict, comps: pd.DataFrame,
               f"(context only — blended across all ticket types)")
     print(f"{'='*65}\n")
 
+def classify_section(name: str) -> str:
+    """
+    Normalize raw section labels into broad seat-location buckets.
+    """
+    if not name:
+        return "Unknown"
+
+    n = str(name).upper()
+
+    if any(k in n for k in [
+        "GA", "GENERAL ADMISSION", "STANDING", "LAWN", "FIELD", "INFIELD", "SRO"
+    ]):
+        return "GA / General Admission"
+
+    if any(k in n for k in ["FLOOR", "PIT", "MOSH"]):
+        return "Floor / Pit"
+
+    if any(k in n for k in [
+        "CLUB", "SUITE", "VIP", "BOX", "LOGE", "LOUNGE",
+        "TERRACE", "PREMIUM", "PLATINUM"
+    ]):
+        return "Club / Suite / VIP"
+
+    if any(k in n for k in [
+        "UPPER", "300", "400", "500", "GRANDSTAND", "BLEACHER"
+    ]):
+        return "Upper Bowl"
+
+    if any(k in n for k in [
+        "LOWER", "100", "200", "MAIN", "ORCHESTRA", "MEZZANINE"
+    ]):
+        return "Lower Bowl"
+
+    return "Other"
+
+
+def get_inventory_snapshots(
+    event_id: int,
+    lookback_days: int = 45,
+) -> pd.DataFrame:
+    """
+    Pull InventoryStream snapshots for one event over a recent window.
+
+    This provides:
+    - section-level price movement
+    - listing/ticket scarcity over time
+    - cross-marketplace movement by DataSource
+
+    InventoryStream is safe for this because we always filter by exact EventID.
+    """
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    cutoff_unix = int(cutoff_dt.timestamp())
+
+    query = f"""
+    WITH base AS (
+        SELECT
+            SnapshotId,
+            Time,
+            TIMESTAMP_SECONDS(Time)                AS snapshot_ts,
+            DATE(TIMESTAMP_SECONDS(Time))          AS snapshot_date,
+            EventID,
+            DataSource,
+            BlockId,
+            SectionName,
+            Row,
+            CAST(Quantity AS INT64)               AS Quantity,
+            CAST(Price AS FLOAT64)                AS Price,
+            StockType
+        FROM `data-ticketcity.TC_Data.InventoryStream`
+        WHERE EventID = {event_id}
+          AND Time >= {cutoff_unix}
+          AND Price > 0
+          AND Price < 50000
+          AND Quantity > 0
+    )
+    SELECT
+        SnapshotId,
+        Time,
+        snapshot_ts,
+        snapshot_date,
+        EventID,
+        DataSource,
+        BlockId,
+        SectionName,
+        Row,
+        Quantity,
+        Price,
+        StockType
+    FROM base
+    ORDER BY snapshot_ts ASC
+    """
+
+    job = client.query(query)
+    df = job.to_dataframe()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    df["section_group"] = df["SectionName"].apply(classify_section)
+    df["ticket_class"]  = df.apply(
+        lambda r: classify_ticket_class(r["SectionName"], r["Row"]),
+        axis=1
+    )
+
+    # Snapshot-level dedupe safeguard
+    df = df.drop_duplicates(
+        subset=["SnapshotId", "BlockId", "SectionName", "Row", "Price", "Quantity"]
+    ).copy()
+
+    return df
+
+
+def get_ticketcity_section_position(
+    event_id: int,
+    lookback_days: int = 45,
+) -> pd.DataFrame:
+    """
+    Compare TicketCity-owned inventory to total market inventory by snapshot + section.
+    """
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    cutoff_unix = int(cutoff_dt.timestamp())
+
+    query = f"""
+    WITH market AS (
+        SELECT
+            i.SnapshotId,
+            DATE(TIMESTAMP_SECONDS(i.Time))            AS snapshot_date,
+            TIMESTAMP_SECONDS(i.Time)                  AS snapshot_ts,
+            i.BlockId,
+            i.SectionName,
+            i.Row,
+            CAST(i.Quantity AS INT64)                 AS Quantity,
+            CAST(i.Price AS FLOAT64)                  AS Price
+        FROM `data-ticketcity.TC_Data.InventoryStream` i
+        WHERE i.EventID = {event_id}
+          AND i.Time >= {cutoff_unix}
+          AND i.Price > 0
+          AND i.Price < 50000
+          AND i.Quantity > 0
+    ),
+    tc AS (
+        SELECT DISTINCT
+            CAST(__key__.name AS STRING)              AS BlockId
+        FROM `data-ticketcity.TC_Data.TicketCity_Tickets`
+        WHERE tfs_event_id = {event_id}
+           OR CAST(tfs_event_id AS STRING) = '{event_id}'
+    )
+    SELECT
+        m.SnapshotId,
+        m.snapshot_date,
+        m.snapshot_ts,
+        m.BlockId,
+        m.SectionName,
+        m.Row,
+        m.Quantity,
+        m.Price,
+        CASE WHEN tc.BlockId IS NOT NULL THEN 1 ELSE 0 END AS is_tc
+    FROM market m
+    LEFT JOIN tc
+        ON m.BlockId = tc.BlockId
+    ORDER BY m.snapshot_ts ASC
+    """
+
+    df = client.query(query).to_dataframe()
+    if df.empty:
+        return pd.DataFrame()
+
+    df["section_group"] = df["SectionName"].apply(classify_section)
+    df["ticket_class"] = df.apply(
+        lambda r: classify_ticket_class(r["SectionName"], r["Row"]),
+        axis=1
+    )
+
+    grouped = (
+        df.groupby(["snapshot_date", "section_group", "ticket_class"], dropna=False)
+          .agg(
+              market_listing_count=("BlockId", "nunique"),
+              market_ticket_count=("Quantity", "sum"),
+              market_median_price=("Price", "median"),
+              tc_listing_count=("is_tc", "sum"),
+          )
+          .reset_index()
+    )
+
+    tc_tickets = (
+        df[df["is_tc"] == 1]
+        .groupby(["snapshot_date", "section_group", "ticket_class"], dropna=False)["Quantity"]
+        .sum()
+        .reset_index(name="tc_ticket_count")
+    )
+
+    grouped = grouped.merge(
+        tc_tickets,
+        on=["snapshot_date", "section_group", "ticket_class"],
+        how="left"
+    )
+    grouped["tc_ticket_count"] = grouped["tc_ticket_count"].fillna(0)
+
+    grouped["tc_listing_share"] = np.where(
+        grouped["market_listing_count"] > 0,
+        grouped["tc_listing_count"] / grouped["market_listing_count"] * 100,
+        np.nan
+    )
+    grouped["tc_ticket_share"] = np.where(
+        grouped["market_ticket_count"] > 0,
+        grouped["tc_ticket_count"] / grouped["market_ticket_count"] * 100,
+        np.nan
+    )
+
+    return grouped.sort_values(
+        ["snapshot_date", "tc_ticket_share"],
+        ascending=[True, False]
+    )
+
+
+def compute_section_market_dynamics(snapshot_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build:
+    1) point-in-time section summary (latest snapshot)
+    2) section trend table across the snapshot window
+    """
+    if snapshot_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Use the most recent snapshot date for the current state summary
+    latest_date = snapshot_df["snapshot_date"].max()
+    latest = snapshot_df[snapshot_df["snapshot_date"] == latest_date].copy()
+
+    section_summary = (
+        latest.groupby(["section_group", "ticket_class"], dropna=False)
+              .agg(
+                  n_listings=("BlockId", "nunique"),
+                  total_tickets=("Quantity", "sum"),
+                  median_price=("Price", "median"),
+                  min_price=("Price", "min"),
+                  max_price=("Price", "max"),
+              )
+              .reset_index()
+              .sort_values(["ticket_class", "median_price"], ascending=[True, True])
+    )
+
+    daily = (
+        snapshot_df.groupby(
+            ["snapshot_date", "section_group", "ticket_class"], dropna=False
+        )
+        .agg(
+            listing_count=("BlockId", "nunique"),
+            ticket_count=("Quantity", "sum"),
+            median_price=("Price", "median"),
+            min_price=("Price", "min"),
+            max_price=("Price", "max"),
+        )
+        .reset_index()
+        .sort_values(["section_group", "ticket_class", "snapshot_date"])
+    )
+
+    trend_rows = []
+
+    for (section_group, ticket_class), grp in daily.groupby(
+        ["section_group", "ticket_class"], dropna=False
+    ):
+        g = grp.sort_values("snapshot_date").copy()
+        if g["snapshot_date"].nunique() < 3:
+            continue
+
+        if g["listing_count"].max() < 2:
+            continue
+        first = g.iloc[0]
+        last  = g.iloc[-1]
+
+        # 14-day anchor: closest row at or before last_date - 14d
+        anchor_date = last["snapshot_date"] - pd.Timedelta(days=14)
+        anchor_pool = g[g["snapshot_date"] <= anchor_date]
+        anchor = anchor_pool.iloc[-1] if not anchor_pool.empty else first
+
+        price_change_14d   = pct_change_safe(anchor["median_price"], last["median_price"])
+        ticket_change_14d  = pct_change_safe(anchor["ticket_count"], last["ticket_count"])
+        listing_change_14d = pct_change_safe(anchor["listing_count"], last["listing_count"])
+
+        scarcity_index = (
+            1000 / last["ticket_count"] if last["ticket_count"] and last["ticket_count"] > 0 else np.nan
+        )
+
+        behavior = classify_market_behavior(
+            price_change_14d=price_change_14d,
+            ticket_change_14d=ticket_change_14d,
+            listing_change_14d=listing_change_14d,
+        )
+
+        trend_rows.append({
+            "section_group": section_group,
+            "ticket_class": ticket_class,
+            "days_observed": int((last["snapshot_date"] - first["snapshot_date"]).days),
+            "latest_listing_count": int(last["listing_count"]),
+            "latest_ticket_count": int(last["ticket_count"]),
+            "latest_median_price": float(last["median_price"]),
+            "price_change_14d_pct": price_change_14d,
+            "ticket_change_14d_pct": ticket_change_14d,
+            "listing_change_14d_pct": listing_change_14d,
+            "scarcity_index": scarcity_index,
+            "behavior_flag": behavior,
+        })
+
+    trends = pd.DataFrame(trend_rows)
+
+    if not trends.empty:
+        trends = trends.sort_values(
+            ["behavior_flag", "scarcity_index", "latest_median_price"],
+            ascending=[True, False, False]
+        )
+
+    return section_summary, trends
+
+
+def build_ga_vs_reserved(section_summary: pd.DataFrame) -> pd.DataFrame:
+    """
+    Roll section summary into GA vs RESERVED grouping.
+    """
+    if section_summary.empty:
+        return pd.DataFrame()
+
+    df = section_summary.copy()
+    df["segment"] = np.where(df["ticket_class"] == "GA", "GA / Floor", "Reserved")
+
+    out = (
+        df.groupby("segment", dropna=False)
+          .agg(
+              n_listings=("n_listings", "sum"),
+              total_tickets=("total_tickets", "sum"),
+              median_price=("median_price", "median"),
+              min_price=("min_price", "min"),
+              max_price=("max_price", "max"),
+          )
+          .reset_index()
+          .sort_values("median_price")
+    )
+    return out
+
+
+def run_section_analysis(event_id: int, lookback_days: int = 45) -> dict:
+    """
+    Full Deliverable 1 section + marketplace dynamics analysis.
+
+    Returns:
+    - latest section summary
+    - GA vs reserved rollup
+    - section trend / scarcity / decay labels
+    - TicketCity share by section
+    """
+
+    print(f"\n⏳ Running section-level market dynamics analysis.")
+
+    snapshots = get_inventory_snapshots(event_id, lookback_days=lookback_days)
+    if snapshots.empty:
+        print(f"   No InventoryStream data for EventID {event_id}")
+        print(f"   (InventoryStream only holds recent history and active events)")
+        return {}
+
+    n_snapshots = snapshots["snapshot_date"].nunique()
+    n_sources   = snapshots["DataSource"].nunique() if "DataSource" in snapshots.columns else 0
+    print(f"   {len(snapshots):,} rows across {n_snapshots} snapshot days | {n_sources} sources")
+
+    section_summary, section_trends = compute_section_market_dynamics(snapshots)
+    ga_vs_reserved = build_ga_vs_reserved(section_summary)
+    tc_position = get_ticketcity_section_position(event_id, lookback_days=lookback_days)
+    source_summary = (
+    snapshots.groupby(["snapshot_date", "DataSource"], dropna=False)
+    .agg(
+        listing_count=("BlockId", "nunique"),
+        ticket_count=("Quantity", "sum"),
+        median_price=("Price", "median"),
+    )
+    .reset_index()
+)
+
+    scarcity_leaders = pd.DataFrame()
+    decay_sections   = pd.DataFrame()
+    reliable_sections = pd.DataFrame()
+
+    
+
+    if not section_trends.empty:
+        scarcity_leaders = section_trends.sort_values(
+            ["scarcity_index", "latest_median_price"],
+            ascending=[False, False]
+        ).head(5)
+
+        decay_sections = section_trends[
+            section_trends["behavior_flag"] == "DECAY_RISK"
+        ].sort_values("price_change_14d_pct")
+
+        reliable_sections = section_trends[
+            section_trends["behavior_flag"] == "RELIABLE"
+        ].sort_values("ticket_change_14d_pct")
+
+    tc_latest = pd.DataFrame()
+    if not tc_position.empty:
+        latest_tc_date = tc_position["snapshot_date"].max()
+        tc_latest = (
+            tc_position[tc_position["snapshot_date"] == latest_tc_date]
+            .sort_values("tc_ticket_share", ascending=False)
+        )
+
+    return {
+        "total_rows": int(len(snapshots)),
+        "snapshot_days": int(n_snapshots),
+        "source_count": int(n_sources),
+        "total_listings": int(section_summary["n_listings"].sum()) if not section_summary.empty else 0,
+        "section_summary": section_summary,
+        "ga_vs_reserved": ga_vs_reserved,
+        "section_trends": section_trends,
+        "scarcity_leaders": scarcity_leaders,
+        "decay_sections": decay_sections,
+        "reliable_sections": reliable_sections,
+        "tc_position_latest": tc_latest,
+        "source_summary": source_summary,
+    }
+
+def classify_decay_risk(comp_ids: list) -> dict:
+    """
+    Classify the comp pool's typical decay profile.
+    Returns: decay_class (RELIABLE/MODERATE/HIGH_DECAY),
+             timing_flag, and a guidance string.
+    """
+    if not comp_ids:
+        return {"decay_class": "UNKNOWN", "timing_flag": "UNKNOWN", "guidance": "No comp data."}
+
+    ids_str = ", ".join(str(i) for i in comp_ids)
+    query = f"""
+    SELECT
+        PID AS event_id,
+        Avg_Order_Size AS price,
+        Orders,
+        DATE_DIFF(
+            SAFE.PARSE_DATE('%m/%d/%y', SUBSTR(Date, 1, 8)),
+            Report_Date, DAY
+        ) AS days_before_event
+    FROM `data-ticketcity.TFS_Reports.75_Event_Daily`
+    WHERE PID IN ({ids_str})
+      AND Orders > 0 AND Avg_Order_Size > 0
+    ORDER BY PID, Report_Date ASC
+    """
+    df = client.query(query).to_dataframe()
+    df = df[(df["days_before_event"] >= 0) & (df["days_before_event"] <= 365)]
+
+    if df.empty:
+        return {"decay_class": "UNKNOWN", "timing_flag": "UNKNOWN", "guidance": "No trajectory data."}
+
+    decay_pcts, early_pcts, late_pcts, peak_uplifts = [], [], [], []
+
+    for eid, grp in df.groupby("event_id"):
+        g = grp.sort_values("days_before_event", ascending=False)
+        baseline_w = g[(g["days_before_event"] >= 60) & (g["days_before_event"] <= 120)]["price"]
+        baseline = baseline_w.median() if len(baseline_w) >= 2 else g["price"].iloc[0]
+        if baseline <= 0:
+            continue
+        day0_rows = g[g["days_before_event"] <= 7]["price"]
+        if day0_rows.empty:
+            continue
+        day0_price = float(day0_rows.median())
+        total_orders = g["Orders"].sum()
+        if total_orders == 0:
+            continue
+        early_pct = float(g[g["days_before_event"] >= 60]["Orders"].sum() / total_orders * 100)
+        late_pct  = float(g[g["days_before_event"] <= 14]["Orders"].sum() / total_orders * 100)
+        peak_uplift = float((g["price"].max() - baseline) / baseline * 100)
+        decay_pcts.append(((day0_price - baseline) / baseline) * 100)
+        early_pcts.append(early_pct)
+        late_pcts.append(late_pct)
+        peak_uplifts.append(peak_uplift)
+
+    if not decay_pcts:
+        return {"decay_class": "UNKNOWN", "timing_flag": "UNKNOWN", "guidance": "Insufficient data."}
+
+    med_decay     = float(np.median(decay_pcts))
+    med_early     = float(np.median(early_pcts))
+    med_late      = float(np.median(late_pcts))
+    med_peak      = float(np.median(peak_uplifts))
+
+    # Classify
+    if med_decay >= -10 and med_early >= 40:
+        decay_class = "RELIABLE"
+    elif med_decay >= -10 and med_peak >= 15:
+        decay_class = "RELIABLE"
+    elif med_decay <= -30:
+        decay_class = "HIGH_DECAY"
+    elif med_late >= 60 and med_early <= 20 and med_decay <= -15:
+        decay_class = "HIGH_DECAY"
+    else:
+        decay_class = "MODERATE"
+
+    # Timing flag
+    if decay_class == "HIGH_DECAY" and med_late >= 50:
+        flag     = "LAST_MINUTE_DEMAND"
+        guidance = (
+            f"High decay but demand concentrates late ({med_late:.0f}% in final 14 days). "
+            f"Consider holding to ~21 days out to capture last-minute surge. "
+            f"Risk: if surge doesn't materialize, price will be well below baseline."
+        )
+    elif decay_class == "HIGH_DECAY":
+        flag     = "SELL_EARLY_REQUIRED"
+        guidance = (
+            f"Comps show consistent price erosion to event day (median {med_decay:.1f}%). "
+            f"Sell before day 60 to capture near-baseline value."
+        )
+    elif decay_class == "RELIABLE" and med_peak >= 15:
+        flag     = "HOLD_THROUGH_PEAK"
+        guidance = (
+            f"Reliable event type with a demand peak ~{med_peak:.1f}% above baseline. "
+            f"Hold through the peak window then sell into strength."
+        )
+    elif decay_class == "RELIABLE":
+        flag     = "SELL_ANYTIME"
+        guidance = (
+            f"Price stays within 10% of baseline through event day. "
+            f"Timing is flexible — focus on listing price, not urgency."
+        )
+    elif med_peak >= 10:
+        flag     = "HOLD_THROUGH_PEAK"
+        guidance = (
+            f"Moderate decay with a mid-trajectory peak ({med_peak:.1f}% above baseline). "
+            f"Target selling in the peak window. Avoid holding into the final 2 weeks."
+        )
+    else:
+        flag     = "SELL_ANYTIME"
+        guidance = (
+            f"Moderate, gradual decay ({med_decay:.1f}% to event day). "
+            f"Sell when convenient but complete the sale before the final 14-day window."
+        )
+
+    return {
+        "decay_class":  decay_class,
+        "timing_flag":  flag,
+        "guidance":     guidance,
+        "med_decay_pct": round(med_decay, 1),
+        "med_early_pct": round(med_early, 1),
+        "med_late_pct":  round(med_late, 1),
+        "med_peak_uplift": round(med_peak, 1),
+    }
 # ================================================================== #
 #  MAIN PIPELINE                                                       #
 # ================================================================== #
@@ -1620,9 +2412,20 @@ def run_pipeline(event_id: int,
         market_price = market['avg_order_size'] if market else current_price,
     )
 
-    if comps is None or comps.empty:
-        print("❌ No comps found. Cannot generate recommendation.")
+    max_comp_price = comps['avg_order_size'].max() if not comps.empty else 0
+    price_outlier = current_price > max_comp_price * 3
+
+    if price_outlier:
+        print("\n⚠️  PRICE OUTLIER: No historical comps near this price range.")
+        print("   Recommendation suppressed — insufficient comparable data.")
+        print(f"   Target price: ${current_price:.0f} | "
+              f"Max comp price: ${max_comp_price:.0f}")
         return {}
+
+    WEAK_COMP_CATEGORIES = {'Comedy', 'NCAA Basketball', 'Rock'}
+    if info['Category_Name'] in WEAK_COMP_CATEGORIES and confidence == 'LOW':
+        print(f"\n⚠️  CATEGORY WARNING: {info['Category_Name']} has structurally "
+              f"unreliable comp pools. Treat recommendation as directional only.")
 
     # Cache check
     comp_hash  = abs(hash(tuple(sorted(comps['EventID'].tolist())))) % 100000
@@ -1695,18 +2498,56 @@ def run_pipeline(event_id: int,
     demand = compute_demand_signal(curves, days_before, st_summary)
     print(f"   Demand signal: {demand['signal']}")
 
+    # ── Decay risk classification ─────────────────────────────────
+    print(f"\n⏳ Classifying decay risk...")
+    comp_ids_for_decay = comps['EventID'].tolist() if not comps.empty else []
+    decay = classify_decay_risk(comp_ids_for_decay)
+    print(f"   Decay class: {decay['decay_class']} | Flag: {decay['timing_flag']}")
+
+    # ── Section analysis ──────────────────────────────────────────
+    section = run_section_analysis(event_id)
+
     print(f"\n⏳ Generating recommendation...")
     rec = generate_recommendation(
         curves            = curves,
         current_price     = current_price,
         days_before_event = days_before,
         cost_basis        = cost_basis,
+        mode              = detect_mode(info['Category_Name']),
     )
+
+    # ── Reconcile decay timing_flag with actual rec position ──────────────
+    # classify_decay_risk only sees comp aggregates; it doesn't know whether
+    # the current price is already above the fitted peak for THIS event.
+    # Override HOLD_THROUGH_PEAK when the fitted trajectory shows no upside.
+    if decay and rec and decay.get('timing_flag') == 'HOLD_THROUGH_PEAK':
+        upside   = rec.get('upside_pct', 0)
+        day0_pct = rec.get('day0_pct', 0)
+        med_peak = decay.get('med_peak_uplift', 0)
+        if upside <= 0:
+            # Current price is at or above the fitted peak — holding adds no value
+            if day0_pct <= -10:
+                decay['timing_flag'] = 'SELL_EARLY_REQUIRED'
+                decay['guidance'] = (
+                    f"Comps historically peak ~{med_peak:.0f}% above baseline, but your "
+                    f"current price already reflects that premium. The fitted trajectory "
+                    f"shows {abs(day0_pct):.1f}% downside by event day — sell now to "
+                    f"capture current value rather than waiting for a peak that has passed."
+                )
+            else:
+                decay['timing_flag'] = 'SELL_ANYTIME'
+                decay['guidance'] = (
+                    f"Comps historically peak ~{med_peak:.0f}% above baseline, but your "
+                    f"current price is already at the forecast peak level. "
+                    f"Sell timing is flexible — no further material upside expected."
+                )
 
     print_report(info, comps, confidence, market, rec,
                  tc_share=tc_share,
                  demand=demand,
-                 st_summary=st_summary)
+                 st_summary=st_summary,
+                 decay=decay,
+                 section=section)
 
     return {
         'event_id':   event_id,
@@ -1719,6 +2560,8 @@ def run_pipeline(event_id: int,
         'tc_share':   tc_share,
         'demand':     demand,
         'st_summary': st_summary,
+        'decay':      decay,
+        'section':    section,
     }
 # ================================================================== #
 #  ENTRY POINT                                                         #

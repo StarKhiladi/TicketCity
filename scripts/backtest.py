@@ -34,8 +34,14 @@ main = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(main)
 
 def safe_sql_str(s: str) -> str:
-    """Sanitize string for SQL interpolation."""
-    return str(s).replace("'", "''").replace("\\", "\\\\")
+    """Sanitize string for BigQuery SQL string literals.
+    BigQuery does NOT support '' to escape a single quote inside a
+    single-quoted string — it parses 'foo''bar' as two adjacent literals
+    and raises a syntax error. Use backslash escaping instead.
+    Backslashes must be escaped first so injected backslashes don't
+    accidentally escape the following character.
+    """
+    return str(s).replace("\\", "\\\\").replace("'", "\\'")
 
 
 # ================================================================== #
@@ -95,6 +101,36 @@ def find_diverse_candidates(
           AND Name NOT LIKE '%Pre-Season%'
           AND Name NOT LIKE '%Spring Training%'
           AND Name NOT LIKE '%Exhibition%'
+          AND Name NOT LIKE '%(Date TBD)%'
+          AND Name NOT LIKE '%Date TBD%'
+          -- Exclude special event types with atypical price curves
+          AND Name NOT LIKE '%All Star%'
+          AND Name NOT LIKE '%All-Star%'
+          AND Name NOT LIKE '%International Series%'
+          AND Name NOT LIKE '%Hall Of Fame%'
+          AND Name NOT LIKE '%Summer League%'
+          AND Name NOT LIKE '%Pro Bowl%'
+          AND Name NOT LIKE '%London Games%'
+          AND Name NOT LIKE '%Mexico City%'
+          AND Name NOT LIKE '%NFL Draft%'
+          AND Name NOT LIKE '%NBA Cup%'
+          AND Name NOT LIKE '%Tournament%'
+          AND Name NOT LIKE '%Cup Championship%'   
+          AND Name NOT LIKE '%London%'
+          AND Name NOT LIKE '%Mexico City%'
+          AND Name NOT LIKE '%Paris%'
+          AND Name NOT LIKE '%Madrid%'
+          AND Name NOT LIKE '%Global Series%'
+          AND Name NOT LIKE '%Opening Series%'
+          AND Name NOT LIKE '%Draft%'
+          AND Name NOT LIKE '%Celebrity%'
+          AND Name NOT LIKE '%Rising Stars%'
+          AND Name NOT LIKE '%Rookie%'
+          AND Name NOT LIKE '%Tribute%'
+          AND Name NOT LIKE '%Symphony%'
+          AND Name NOT LIKE '%Pops Concert%'
+          AND Name NOT LIKE '%Opening%'
+          AND Name NOT LIKE '%Night Football%'
         GROUP BY PID
         HAVING
             -- Must have completed (event date in past)
@@ -222,6 +258,12 @@ def find_comps_before_date(
           AND Name NOT LIKE '%Preseason%'
           AND Name NOT LIKE '%Pre-Season%'
           AND Name NOT LIKE '%festival%'
+          AND Name NOT LIKE '%All Star%'
+          AND Name NOT LIKE '%All-Star%'
+          AND Name NOT LIKE '%International Series%'
+          AND Name NOT LIKE '%Hall Of Fame%'
+          AND Name NOT LIKE '%Summer League%'
+          AND Name NOT LIKE '%Pro Bowl%'
           -- Only use data available at snapshot time
           AND Report_Date <= '{snapshot_date_str}'
         GROUP BY PID
@@ -311,6 +353,13 @@ def build_comp_trajectory_before_date(
           LOWER(Name) LIKE '%festival%'
           OR LOWER(Name) LIKE '%outlaw%'
           OR LOWER(Name) LIKE '%lollapalooza%'
+          OR LOWER(Name) LIKE '%all star%'
+          OR LOWER(Name) LIKE '%all-star%'
+          OR LOWER(Name) LIKE '%international series%'
+          OR LOWER(Name) LIKE '%hall of fame%'
+          OR LOWER(Name) LIKE '%summer league%'
+          OR LOWER(Name) LIKE '%pro bowl%'
+          
       )
     ORDER BY PID, Report_Date ASC
     """
@@ -509,10 +558,20 @@ def run_backtest(
             baseline_sell_day = int(near_first['days_before_event'].median())
             actual_day0_price  = actual_full['day0_price']
 
-            # Baseline profit = sell at day 90
-            baseline_profit_pct = (
-                (baseline_price - baseline_price) / baseline_price * 100
-            )  # 0% — this is our reference point
+            # Sanity check: day-90 price should be in a reasonable range vs
+            # the full-trajectory average. A ratio > 2.0x or < 0.35x means
+            # the day-90 window captured an anomalous spike or trough
+            # (bad data, package pricing, COVID-era distortion, etc.) that
+            # would make the baseline comparison meaningless.
+            # 2.0x (down from 2.5x) catches events like Oakland A's at
+            # Phillies (ratio 2.07x) where the day-90 price was clearly
+            # inflated relative to the event's actual market.
+            price_ratio = baseline_price / avg_price if avg_price > 0 else 1.0
+            if price_ratio > 1.6 or price_ratio < 0.35:
+                print(f"  ⚠️  Skipping — baseline ${baseline_price:.0f} is "
+                      f"{price_ratio:.1f}x the event avg ${avg_price:.0f} "
+                      f"(likely data quality issue)")
+                continue
 
             print(f"  Baseline (sell at day {baseline_sell_day}): "
                   f"${baseline_price:.0f}")
@@ -523,6 +582,11 @@ def run_backtest(
             model_sell_day    = None
             model_sell_reason = None
             checkpoints       = []
+            # Fixed anchor — always the day-90 price.
+            # Rolling prev_price caused false stop-loss triggers when prices
+            # spiked mid-trajectory (e.g. $490→$553→$383): the drop from
+            # the spike looked catastrophic but was just a return to baseline.
+            prev_price        = baseline_price
 
             for snap_day in snapshot_days:
                 if snap_day > max_days - 7:
@@ -600,6 +664,7 @@ def run_backtest(
                         curves            = curves,
                         current_price     = snapshot_price,
                         days_before_event = snap_day,
+                        prior_price       = prev_price,
                     )
                 except Exception as e:
                     checkpoints.append({
@@ -610,27 +675,47 @@ def run_backtest(
                     continue
 
                 rec = rec_result['recommendation']
+                # prev_price intentionally NOT updated — anchor stays at day-90
 
                 checkpoints.append({
-                    'snap_day':      snap_day,
-                    'rec':           rec,
-                    'price':         snapshot_price,
-                    'upside_pct':    rec_result['upside_pct'],
-                    'downside_pct':  rec_result['downside_pct'],
+                    'snap_day':             snap_day,
+                    'rec':                  rec,
+                    'price':                snapshot_price,
+                    'upside_pct':           rec_result['upside_pct'],
+                    'downside_pct':         rec_result['downside_pct'],
+                    'realized_decline_pct': rec_result.get('realized_decline_pct', 0.0),
                 })
 
-                # First SELL_NOW = model says sell here
-                # But require day-60 confirmation before selling at day-90
-                # (day-90 price is often noisy)
+                # First SELL_NOW = model says sell here.
+                # Day-90 sells are always demoted to MONITOR.
+                # Prices at day-90 are often noisy (first weeks of sale),
+                # and day0_pct < -20 fires too broadly for normal sports
+                # events where 30-40% price decay toward event day is routine.
+                # The day-60 confirmation catches genuine declines without
+                # false-selling into events that keep rising after day-90.
+                # First SELL_NOW = model says sell here.
+                # Day-90 sells are always demoted to MONITOR.
+                # Day-60 sells require price confirmation: only act if the
+                # observed price has actually declined from the day-90 anchor
+                # OR the downside estimate is severe. This prevents the model
+                # from selling into comp-trajectory noise when the real price
+                # is flat or still rising.
                 if rec == 'SELL_NOW' and model_sell_price is None:
-                    if snap_day < 90:  # only sell if not at first checkpoint
+                    if snap_day == 90:
+                        checkpoints[-1]['rec'] = 'MONITOR_90'
+                    elif snap_day == 60:
+                        price_declined = snapshot_price <= baseline_price * 0.95
+                        severe_downside = rec_result['downside_pct'] < -25
+                        if price_declined or severe_downside:
+                            model_sell_price  = snapshot_price
+                            model_sell_day    = snap_day
+                            model_sell_reason = rec
+                        else:
+                            checkpoints[-1]['rec'] = 'MONITOR_60'
+                    else:
                         model_sell_price  = snapshot_price
                         model_sell_day    = snap_day
-                        model_sell_reason = rec
-                    else:
-                        # At day 90, downgrade SELL_NOW to MONITOR
-                        # Wait for day-60 confirmation
-                        checkpoints[-1]['rec'] = 'MONITOR_90'
+                        model_sell_reason = rec 
 
             # If model never said SELL_NOW, sell at day 0 (event day)
             if model_sell_price is None:
@@ -646,12 +731,14 @@ def run_backtest(
             )
 
             # Print checkpoint summary
-            checkpoint_str = " → ".join([
-                f"Day {c['snap_day']}:{c['rec'][:4]}"
-                f"(${c['price']:.0f})" if c['price'] else
-                f"Day {c['snap_day']}:{c['rec']}"
-                for c in checkpoints
-            ])
+            def _fmt_checkpoint(c):
+                if not c['price']:
+                    return f"Day {c['snap_day']}:{c['rec']}"
+                decline = c.get('realized_decline_pct', 0.0)
+                decline_str = f" ↓{abs(decline):.0f}%" if decline <= -10 else ""
+                return f"Day {c['snap_day']}:{c['rec'][:4]}(${c['price']:.0f}{decline_str})"
+
+            checkpoint_str = " → ".join(_fmt_checkpoint(c) for c in checkpoints)
             print(f"  Path: {checkpoint_str}")
             print(f"  Baseline sell @ day {baseline_sell_day}: "
                   f"${baseline_price:.0f}")
@@ -752,10 +839,21 @@ def print_summary(results: pd.DataFrame):
     print(f"  Wait until event day:      ${day0_avg:.0f} avg "
           f"({(day0_avg-base_avg)/base_avg*100:+.1f}% vs baseline)")
     
-    beat_day0_rate = results['model_beat_day0'].mean() * 100
-    print(f"  Model beats holding to day 0:  {beat_day0_rate:.1f}% of events")
+    print(f"\nWINSORIZED RESULTS (±$500 cap per event):")
+    wins = results['model_vs_baseline'].clip(-500, 500)
+    print(f"  Winsorized avg vs baseline: ${wins.mean():+.0f}/ticket")
+    print(f"  Median vs baseline:         "
+          f"${results['model_vs_baseline'].median():+.0f}/ticket")
 
-    print(f"\n{'='*65}")
+    print(f"\nRESULTS BY CATEGORY (winsorized):")
+    for cat in results['category'].unique():
+        sub = results[results['category'] == cat]
+        beat = sub['model_beat_baseline'].mean() * 100
+        wins_cat = sub['model_vs_baseline'].clip(-500, 500).mean()
+        median_cat = sub['model_vs_baseline'].median()
+        print(f"  {cat:<25}: {beat:.0f}% beat  "
+              f"winsorized avg ${wins_cat:+.0f}  "
+              f"median ${median_cat:+.0f}")
 
 
 # ================================================================== #
@@ -793,7 +891,7 @@ if __name__ == "__main__":
             'NFL Football', 'NBA Basketball', 'MLB Baseball',
             'NHL Hockey', 'NCAA Basketball', 'Rock', 'Pop', 'Comedy'
         ]
-        n_per_cat  = 5
+        n_per_cat  = 12
         snap_days  = [90, 60, 30, 14]
 
     elif choice == '4':

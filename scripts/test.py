@@ -1,9 +1,33 @@
 from google.cloud import bigquery
 import pandas as pd
+from datetime import datetime, timezone
 
 client = bigquery.Client(project="ticketcity-tcg")
 
-query = """
+# Find the most recent VividIntake partition that actually has data.
+# INFORMATION_SCHEMA.PARTITIONS is a free metadata query — no table scan.
+_part_result = client.query("""
+    SELECT partition_id
+    FROM `data-ticketcity.VividIntake.INFORMATION_SCHEMA.PARTITIONS`
+    WHERE table_name = 'Events'
+      AND partition_id NOT IN ('__NULL__', '__UNPARTITIONED__')
+    ORDER BY partition_id DESC
+    LIMIT 1
+""").result()
+
+_part_row = next(iter(_part_result), None)
+if _part_row:
+    # partition_id is YYYYMMDD — convert to YYYY-MM-DD
+    _pid = str(_part_row[0])
+    partition_date = f"{_pid[:4]}-{_pid[4:6]}-{_pid[6:8]}"
+else:
+    # Fallback: yesterday (today's partition may not be loaded yet)
+    from datetime import timedelta
+    partition_date = (datetime.now(timezone.utc) - timedelta(days=1)).strftime('%Y-%m-%d')
+
+print(f"Using partition: {partition_date}")
+
+query = f"""
 SELECT
     e.EventID,
     e.Name,
@@ -19,7 +43,7 @@ FROM (
     SELECT EventID, Name, LocalDate, ListingCount,
            MinPrice, MaxPrice, CategoryID, VenueID
     FROM `data-ticketcity.VividIntake.Events`
-    WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("2026-04-03")
+    WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("{partition_date}")
       AND LocalDate > DATETIME("2026-04-08")
       AND ListingCount > 50
       AND Name NOT LIKE '%Test%'
@@ -29,7 +53,7 @@ FROM (
 JOIN (
     SELECT Category_ID, Category_Name
     FROM `data-ticketcity.VividIntake.Categories`
-    WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("2026-04-03")
+    WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("{partition_date}")
       AND Category_Name IN (
         'NFL Football', 'NCAA Basketball', 'NBA Basketball',
         'MLB Baseball', 'NHL Hockey', 'PGA Golf',
@@ -40,14 +64,13 @@ JOIN (
 JOIN (
     SELECT Venue_ID, Venue_Name, City, State
     FROM `data-ticketcity.VividIntake.Venues`
-    WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("2026-04-03")
+    WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("{partition_date}")
 ) v ON e.VenueID = v.Venue_ID
 ORDER BY c.Category_Name, e.ListingCount DESC
-LIMIT 3 -- top 3 per category via below
+LIMIT 3
 """
 
-# Run once per category to get top 3 each
-category_query = """
+category_query = f"""
 WITH ranked AS (
     SELECT
         e.EventID,
@@ -68,7 +91,7 @@ WITH ranked AS (
         SELECT EventID, Name, LocalDate, ListingCount,
                MinPrice, MaxPrice, CategoryID, VenueID
         FROM `data-ticketcity.VividIntake.Events`
-        WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("2026-04-03")
+        WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("{partition_date}")
           AND LocalDate > DATETIME("2026-04-08")
           AND ListingCount > 50
           AND Name NOT LIKE '%Test%'
@@ -78,7 +101,7 @@ WITH ranked AS (
     JOIN (
         SELECT Category_ID, Category_Name
         FROM `data-ticketcity.VividIntake.Categories`
-        WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("2026-04-03")
+        WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("{partition_date}")
           AND Category_Name IN (
             'NFL Football', 'NCAA Basketball', 'NBA Basketball',
             'MLB Baseball', 'NHL Hockey', 'PGA Golf',
@@ -89,7 +112,7 @@ WITH ranked AS (
     JOIN (
         SELECT Venue_ID, Venue_Name, City, State
         FROM `data-ticketcity.VividIntake.Venues`
-        WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("2026-04-03")
+        WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) = TIMESTAMP("{partition_date}")
     ) v ON e.VenueID = v.Venue_ID
 )
 SELECT EventID, Name, LocalDate, ListingCount,
