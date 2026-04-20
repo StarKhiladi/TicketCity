@@ -1,0 +1,23 @@
+# Keep root docs
+# CLAUDE.md, README.md, requirements.txt stay tracked automatically unless ignored
+
+# Ignore data
+data/
+
+# Ignore all scripts by default
+scripts/*
+
+# Allow only these
+!scripts/main.py
+!scripts/frontend.py
+
+# Python junk
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment / secrets
+.env
+venv/
+.venv/
