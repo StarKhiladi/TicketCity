@@ -1,7 +1,19 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from main import run_pipeline
+from main import run_pipeline, PARTITION
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def run_pipeline_cached(event_id: int, listed_price: float | None,
+                        cost_basis: float | None, n_comps: int = 15):
+    print(f"STREAMLIT CACHE MISS: run_pipeline_cached({event_id}, {listed_price}, {cost_basis}, {n_comps})")
+    return run_pipeline(
+        event_id=event_id,
+        listed_price=listed_price,
+        cost_basis=cost_basis,
+        n_comps=n_comps,
+    )
 
 st.set_page_config(
     page_title="TicketCity Pricing Analyzer",
@@ -320,8 +332,15 @@ st.markdown(f"""
   <div>
     <div style="font-size:1.42rem;font-weight:800;color:{C_TEXT};
                 letter-spacing:-0.02em;">TicketCity Pricing Analyzer</div>
-    <div style="font-size:0.82rem;color:{C_MUTED};margin-top:2px;">
+    <div style="font-size:0.82rem;color:{C_MUTED};margin-top:2px;
+                display:flex;align-items:center;gap:0.6rem;">
       Data-driven sell / hold recommendations for ticket inventory
+      <span style="display:inline-flex;align-items:center;gap:4px;
+                   background:{C_BG};border:1px solid {C_BORDER};
+                   border-radius:6px;padding:1px 8px;
+                   font-size:0.75rem;color:{C_MUTED};font-weight:600;">
+        🗓 Data as of {PARTITION}
+      </span>
     </div>
   </div>
 </div>
@@ -421,11 +440,12 @@ if run_btn:
     </div>
     """, unsafe_allow_html=True)
 
-    result = run_pipeline(
-        event_id=int(event_id_raw.strip()),
-        listed_price=listed_price or None,
-        cost_basis=cost_basis or None,
-    )
+    result = run_pipeline_cached(
+    event_id=int(event_id_raw.strip()),
+    listed_price=listed_price or None,
+    cost_basis=cost_basis or None,
+    n_comps=15,
+)
     _loading.empty()
 
     if not result:
@@ -525,7 +545,7 @@ if run_btn:
          f"{rec['upside_pct']:+.1f}% upside",
          rec['upside_pct'] > 0, C_GREEN),
         ("Day-Of Forecast", f"${rec['day0_price']:,.2f}",
-         f"{rec['day0_pct']:+.1f}% vs now",
+         f"{rec['day0_pct']:+.1f}% median · floor ${rec.get('day0_p25_price', rec['day0_price']):,.0f} ({rec.get('day0_p25_pct', rec['day0_pct']):+.1f}%)",
          rec['day0_pct'] > 0, C_AMBER),
         ("Days to Event", str(rec['days_remaining']), None, None, C_BLUE),
         ("Comp Confidence", confidence, None, None, conf_color),
@@ -550,12 +570,14 @@ if run_btn:
             for day, data in sorted(predictions.items(), reverse=True)
         ])
 
-        days_rem   = rec['days_remaining']
-        cur_price  = rec['current_price']
-        base_price = rec['baseline_price']
-        peak_price = rec['peak_price']
-        day0_price = rec['day0_price']
-        peak_day   = rec.get('peak_day', 0)
+        days_rem       = rec['days_remaining']
+        cur_price      = rec['current_price']
+        base_price     = rec['baseline_price']
+        peak_price     = rec['peak_price']
+        day0_price     = rec['day0_price']
+        day0_p25_price = rec.get('day0_p25_price', day0_price)
+        day0_p25_pct   = rec.get('day0_p25_pct', 0)
+        peak_day       = rec.get('peak_day', 0)
 
         # Add the current point explicitly
         current_row = pd.DataFrame([{
@@ -674,7 +696,7 @@ if run_btn:
                 showlegend=True,
             ))
 
-        # Event-day point
+        # Event-day point (median forecast)
         fig.add_trace(go.Scatter(
             x=[days_rem],
             y=[day0_price],
@@ -686,9 +708,34 @@ if run_btn:
                 symbol='diamond',
                 line=dict(color=C_CARD, width=1.5)
             ),
-            hovertemplate=f"<b>Event Day ({days_rem} days from today)</b><br>${day0_price:,.2f}<extra>Day-of</extra>",
+            hovertemplate=f"<b>Event Day ({days_rem} days from today)</b><br>${day0_price:,.2f}<extra>Day-of Median</extra>",
             showlegend=True,
         ))
+
+        # Day-of floor: p25 of comp outcomes at event day.
+        # 1-in-4 comparable events ended at or below this price —
+        # represents unsmoothed last-minute risk TFS daily avgs don't capture.
+        if day0_p25_price < day0_price * 0.99:
+            fig.add_trace(go.Scatter(
+                x=[days_rem],
+                y=[day0_p25_price],
+                mode='markers',
+                name='Day-of Floor (p25)',
+                marker=dict(
+                    size=9,
+                    color=C_RED,
+                    symbol='triangle-down',
+                    line=dict(color=C_CARD, width=1.5),
+                    opacity=0.85,
+                ),
+                hovertemplate=(
+                    f"<b>Day-of Floor p25 ({days_rem} days from today)</b><br>"
+                    f"${day0_p25_price:,.2f} ({day0_p25_pct:+.1f}% vs now)<br>"
+                    f"1-in-4 comps ended at or below this price"
+                    f"<extra>Floor Risk</extra>"
+                ),
+                showlegend=True,
+            ))
 
         # Annotations
         ann_points = [
@@ -722,17 +769,18 @@ if run_btn:
                 opacity=0.95,
             )
 
-        # Baseline label
-        max_x = max(df_pred["Days From Today"]) if not df_pred.empty else days_rem
+        # Baseline label — right-anchored so it never collides with the "Now"
+        # annotation box which is always at x=0 (left edge).
         fig.add_annotation(
-            x=max_x,
-            y=base_price,
+            x=0.99,
+            xref="paper",
+            y=0.02,
+            yref="paper",
             text=f"Baseline ${base_price:,.2f}",
             showarrow=False,
             font=dict(color=C_MUTED, size=10, family="Inter, sans-serif"),
             xanchor="right",
             yanchor="bottom",
-            yshift=5,
             bgcolor="rgba(0,0,0,0)",
         )
 
@@ -740,7 +788,7 @@ if run_btn:
         all_prices = (
             list(df_pred["High Estimate"]) +
             list(df_pred["Low Estimate"]) +
-            [base_price, cur_price, peak_price, day0_price]
+            [base_price, cur_price, peak_price, day0_price, day0_p25_price]
         )
         positive_prices = [p for p in all_prices if p > 0]
         price_min = min(positive_prices) if positive_prices else 0
@@ -920,7 +968,8 @@ Current Demand
             if market:
                 rows.extend([
                     ("Most Recent Sale", f'${market["avg_order_size"]:,.2f}'),
-                    ("Orders on That Date", f'{market["orders"]:,}')
+                    ("Orders on That Date", f'{market["orders"]:,}'),
+                    ("Data as of", str(market.get("report_date", "—"))),
                 ])
 
             rows_html = "".join(
@@ -993,7 +1042,9 @@ Current Demand
              f"{rec['peak_profit_pct']:+.1f}%  (${rec['peak_profit_abs']:+.2f})",
              rec['peak_profit_pct'] >= 0, C_GREEN),
             ("Wait Until Day-Of", f"${rec['day0_price']:,.2f}",
-             f"{rec['day0_profit_pct']:+.1f}%  (${rec['day0_profit_abs']:+.2f})",
+             f"{rec['day0_profit_pct']:+.1f}%  (${rec['day0_profit_abs']:+.2f})"
+             + (f"  ·  floor ${rec.get('day0_p25_price', rec['day0_price']):,.0f} p25"
+                if rec.get('day0_p25_price', rec['day0_price']) < rec['day0_price'] * 0.99 else ""),
              rec['day0_profit_pct'] >= 0, C_AMBER),
         ]
         metrics_row(pnl_cards)
@@ -1162,10 +1213,18 @@ Current Demand
     # ── Comparable Events ─────────────────────────────────────────────────────
     section_header("Comparable Events")
     if not comps.empty:
-        display_cols = ['Name', 'EventDate', 'City', 'total_orders', 'avg_order_size', 'similarity_score']
+        display_cols = ['tier', 'weight', 'Name', 'EventDate', 'City',
+                        'total_orders', 'avg_order_size', 'similarity_score']
         display_cols = [c for c in display_cols if c in comps.columns]
-        df_display = comps[display_cols].head(10).copy()
-        df_display.columns = [c.replace('_', ' ').title() for c in df_display.columns]
+        df_display = comps[display_cols].head(15).copy()
+        rename_map = {
+            'tier': 'T', 'weight': 'Wt',
+            'total_orders': 'Orders', 'avg_order_size': 'Avg Price',
+            'similarity_score': 'Score',
+            'EventDate': 'Date', 'Name': 'Event',
+        }
+        df_display.columns = [rename_map.get(c, c.replace('_', ' ').title())
+                               for c in df_display.columns]
         st.dataframe(df_display, use_container_width=True, hide_index=True)
     else:
         st.markdown(

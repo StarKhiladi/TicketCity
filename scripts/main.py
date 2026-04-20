@@ -5,8 +5,13 @@ TicketCity Ticket Pricing Analyzer
 Single script — enter an EventID, get a full analysis.
 """
 
+import copy
 import os
 import sys
+import json
+import time
+import hashlib
+import pickle
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
@@ -15,13 +20,105 @@ from google.cloud import bigquery
 import re
 
 # ================================================================== #
-#  SETUP                                                               #
+#  SETUP                                                             #
 # ================================================================== #
 client = bigquery.Client(project="ticketcity-tcg")
 TODAY  = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-TRAJECTORIES_DIR = Path("data/trajectories")
+
+DATA_DIR = Path("data")
+TRAJECTORIES_DIR = DATA_DIR / "trajectories"
+CACHE_DIR = DATA_DIR / "cache"
+BQ_CACHE_DIR = CACHE_DIR / "bigquery"
+
+DATA_DIR.mkdir(exist_ok=True)
 TRAJECTORIES_DIR.mkdir(parents=True, exist_ok=True)
-Path("data").mkdir(exist_ok=True)
+BQ_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# cache TTLs in seconds
+CACHE_TTL_EVENT_INFO = 6 * 60 * 60          # 6 hours
+CACHE_TTL_MARKET = 30 * 60                  # 30 minutes
+CACHE_TTL_TC_SHARE = 15 * 60                # 15 minutes
+CACHE_TTL_PERFORMER_LOOKUP = 12 * 60 * 60  # 12 hours
+CACHE_TTL_COMPS = 6 * 60 * 60              # 6 hours
+CACHE_TTL_TRAJECTORIES = 6 * 60 * 60       # 6 hours
+CACHE_TTL_SECTION = 30 * 60                # 30 minutes
+CACHE_TTL_DECAY = 30 * 60                  # 30 minutes
+def _compute_code_version() -> str:
+    """Hash this file so any code change auto-invalidates all caches."""
+    try:
+        content = Path(__file__).read_bytes()
+        return hashlib.md5(content).hexdigest()[:12]
+    except Exception:
+        return "unknown"
+
+CACHE_VERSION = _compute_code_version()
+
+
+def _stable_cache_key(prefix: str, payload: dict) -> str:
+    """
+    Create a stable hash key for cache file names.
+    """
+    full_payload = {
+        "cache_version": CACHE_VERSION,
+        **payload
+    }
+    raw = json.dumps(full_payload, sort_keys=True, default=str)
+    digest = hashlib.md5(raw.encode("utf-8")).hexdigest()
+    return f"{prefix}_{digest}"
+
+
+def _cache_path(cache_key: str) -> Path:
+    return BQ_CACHE_DIR / f"{cache_key}.pkl"
+
+
+def load_cache(cache_key: str, ttl_seconds: int):
+    """
+    Load a cached object if it exists and is still fresh.
+    If the cache file is corrupted, delete it and return None.
+    """
+    path = _cache_path(cache_key)
+    if not path.exists():
+        return None
+
+    age = time.time() - path.stat().st_mtime
+    if age > ttl_seconds:
+        return None
+
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        try:
+            path.unlink()
+        except Exception:
+            pass
+        return None
+
+
+def save_cache(cache_key: str, value):
+    """
+    Save an object to disk cache.
+    """
+    path = _cache_path(cache_key)
+    with open(path, "wb") as f:
+        pickle.dump(value, f)
+
+
+def cached_result(prefix: str, payload: dict, ttl_seconds: int, builder):
+    """
+    Generic disk-backed cache wrapper.
+    """
+    cache_key = _stable_cache_key(prefix, payload)
+    cached = load_cache(cache_key, ttl_seconds)
+
+    if cached is not None:
+        print(f"   Using cache: {prefix}")
+        return cached
+
+    print(f"   Cache MISS: {prefix}")
+    result = builder()
+    save_cache(cache_key, result)
+    return result
 
 def _get_vivid_partition() -> str:
     """Return the most recent loaded VividIntake partition date (YYYY-MM-DD).
@@ -119,6 +216,46 @@ PRACTICE_ROUND_EXCLUSIONS = [
 GOLF_WEEKDAY_EXCLUSIONS = [
     '%Monday%', '%Tuesday%', '%Wednesday%'
 ]
+# Patterns that identify multi-artist festival / multi-day pass events.
+# Applied to comp discovery when target is a solo show, and to trajectory
+# pulls universally (festivals corrupt per-show baselines).
+FESTIVAL_EXCLUSIONS = [
+    '%Festival%', '% Fest %', '% Fest)', '%Music Fest%',
+    '% Day Pass%', '%Weekend Pass%', '%3-Day%', '%3 Day%',
+    '%2-Day%', '%2 Day%', '%4-Day%', '%4 Day%',
+    '%Lollapalooza%', '%Coachella%', '%Bonnaroo%',
+    '%Rolling Loud%', '%Outside Lands%', '%Governors Ball%',
+    '%Gov Ball%', '%Austin City Limits%', '% ACL %',
+    '%Summerfest%', '%Firefly%', '%Warped Tour%', '%Ozzfest%',
+    '%Stagecoach%', '%Bottlerock%', '%Pitchfork%',
+    '%Electric Daisy%', '%EDC %', '%Ultra Music%',
+    '%Burning Man%', '%South by Southwest%', '%SXSW%',
+    '%Outlaw Music%', '%When We Were Young%',
+    # Multi-artist showcase events — rotating lineups corrupt solo-artist comps
+    '%Jingle Ball%', '%iHeartRadio%', '%iHeart Radio%',
+    '%Kiss Concert%', '%Z100%', '%Hot 97%', '%Power 96%',
+    '%Wango Tango%', '%Radio Disney%',
+    '%Pepsi Super Bowl%', '%Pepsi Halftime%',
+    '%Made In America%', '%Global Citizen%',
+    '%VH1 Storytellers%', '%MTV Unplugged%',
+    '%Lovers & Friends%', '%Lovers and Friends%',
+    '%Day N Vegas%', '%Camp Flog Gnaw%',
+    '% Tour Package%', '%Presents:%',
+]
+# Keywords used in Python (lower-case) to detect whether the TARGET event
+# is itself a festival — prevents over-excluding when user inputs a festival.
+_FESTIVAL_KEYWORDS = {
+    'festival', 'fest', 'lollapalooza', 'coachella', 'bonnaroo',
+    'rolling loud', 'outside lands', 'governors ball', 'gov ball',
+    'austin city limits', 'summerfest', 'firefly', 'warped tour',
+    'stagecoach', 'bottlerock', 'electric daisy', 'edc ', 'ultra music',
+    'burning man', 'sxsw', 'south by southwest', 'outlaw music',
+    'when we were young', 'day pass', 'weekend pass',
+    # Multi-artist showcase keywords
+    'jingle ball', 'iheartradio', 'iheart radio', 'wango tango',
+    'made in america', 'global citizen', 'lovers & friends',
+    'lovers and friends', 'day n vegas', 'camp flog gnaw',
+}
 
 # ================================================================== #
 #  TOURNAMENT TIERS                                                    #
@@ -296,113 +433,128 @@ def classify_market_behavior(
 #  STEP 1: EVENT INFO                                                  #
 # ================================================================== #
 def get_event_info(event_id: int) -> dict:
-    query = f"""
-    SELECT
-        e.EventID,
-        e.Name,
-        e.LocalDate,
-        e.VenueID,
-        e.EventType,
-        e.TicketCount,
-        e.ListingCount,
-        e.MinPrice,
-        e.MaxPrice,
-        e.CategoryID,
-        ep.Performer_ID,
-        ep.Master,
-        p.Performer_Name,
-        c.Category_Name,
-        v.Venue_Name,
-        v.City,
-        v.State
-    FROM `data-ticketcity.VividIntake.Events` e
-    LEFT JOIN `data-ticketcity.VividIntake.EventPerformers` ep
-        ON e.EventID = ep.Event_ID
-        AND DATE(ep._PARTITIONTIME) = DATE(e._PARTITIONTIME)
-    LEFT JOIN `data-ticketcity.VividIntake.Performers` p
-        ON ep.Performer_ID = p.Performer_ID
-        AND DATE(p._PARTITIONTIME) = DATE(e._PARTITIONTIME)
-    LEFT JOIN `data-ticketcity.VividIntake.Categories` c
-        ON e.CategoryID = c.Category_ID
-        AND DATE(c._PARTITIONTIME) = DATE(e._PARTITIONTIME)
-    LEFT JOIN `data-ticketcity.VividIntake.Venues` v
-        ON e.VenueID = v.Venue_ID
-        AND DATE(v._PARTITIONTIME) = DATE(e._PARTITIONTIME)
-    WHERE e.EventID = {event_id}
-      AND DATE(e._PARTITIONTIME) = DATE("{PARTITION}")
-    ORDER BY e._PARTITIONTIME DESC
-    LIMIT 20
-    """
-    df = client.query(query).to_dataframe()
+    def _builder():
+        query = f"""
+        SELECT
+            e.EventID,
+            e.Name,
+            e.LocalDate,
+            e.VenueID,
+            e.EventType,
+            e.TicketCount,
+            e.ListingCount,
+            e.MinPrice,
+            e.MaxPrice,
+            e.CategoryID,
+            ep.Performer_ID,
+            ep.Master,
+            p.Performer_Name,
+            c.Category_Name,
+            v.Venue_Name,
+            v.City,
+            v.State
+        FROM `data-ticketcity.VividIntake.Events` e
+        LEFT JOIN `data-ticketcity.VividIntake.EventPerformers` ep
+            ON e.EventID = ep.Event_ID
+            AND DATE(ep._PARTITIONTIME) = DATE(e._PARTITIONTIME)
+        LEFT JOIN `data-ticketcity.VividIntake.Performers` p
+            ON ep.Performer_ID = p.Performer_ID
+            AND DATE(p._PARTITIONTIME) = DATE(e._PARTITIONTIME)
+        LEFT JOIN `data-ticketcity.VividIntake.Categories` c
+            ON e.CategoryID = c.Category_ID
+            AND DATE(c._PARTITIONTIME) = DATE(e._PARTITIONTIME)
+        LEFT JOIN `data-ticketcity.VividIntake.Venues` v
+            ON e.VenueID = v.Venue_ID
+            AND DATE(v._PARTITIONTIME) = DATE(e._PARTITIONTIME)
+        WHERE e.EventID = {event_id}
+          AND DATE(e._PARTITIONTIME) = DATE("{PARTITION}")
+        ORDER BY e._PARTITIONTIME DESC
+        LIMIT 20
+        """
+        df = client.query(query).to_dataframe()
 
-    if df.empty:
-        return None
+        if df.empty:
+            return None
 
-    row = df.iloc[0]
-    performers_df = (
-        df[['Performer_ID', 'Master', 'Performer_Name']]
-        .dropna(subset=['Performer_ID'])
-        .drop_duplicates(subset=['Performer_ID'])
+        row = df.iloc[0]
+        performers_df = (
+            df[['Performer_ID', 'Master', 'Performer_Name']]
+            .dropna(subset=['Performer_ID'])
+            .drop_duplicates(subset=['Performer_ID'])
+        )
+
+        return {
+            'EventID': int(event_id),
+            'Name': str(row['Name'] or ''),
+            'LocalDate': str(row['LocalDate'] or ''),
+            'VenueID': int(row['VenueID'] or 0),
+            'Venue_Name': str(row['Venue_Name'] or ''),
+            'City': str(row['City'] or ''),
+            'State': str(row['State'] or ''),
+            'EventType': str(row['EventType'] or ''),
+            'TicketCount': int(row['TicketCount'] or 0),
+            'ListingCount': int(row['ListingCount'] or 0),
+            'MinPrice': float(row['MinPrice'] or 0),
+            'MaxPrice': float(row['MaxPrice'] or 0),
+            'CategoryID': int(row['CategoryID'] or 0),
+            'Category_Name': str(row['Category_Name'] or ''),
+            'performers_df': performers_df,
+        }
+
+    return cached_result(
+        prefix="event_info",
+        payload={"event_id": event_id, "partition": PARTITION},
+        ttl_seconds=CACHE_TTL_EVENT_INFO,
+        builder=_builder,
     )
-
-    return {
-        'EventID': int(event_id),
-        'Name': str(row['Name'] or ''),
-        'LocalDate': str(row['LocalDate'] or ''),
-        'VenueID': int(row['VenueID'] or 0),
-        'Venue_Name': str(row['Venue_Name'] or ''),
-        'City': str(row['City'] or ''),
-        'State': str(row['State'] or ''),
-        'EventType': str(row['EventType'] or ''),
-        'TicketCount': int(row['TicketCount'] or 0),
-        'ListingCount': int(row['ListingCount'] or 0),
-        'MinPrice': float(row['MinPrice'] or 0),
-        'MaxPrice': float(row['MaxPrice'] or 0),
-        'CategoryID': int(row['CategoryID'] or 0),
-        'Category_Name': str(row['Category_Name'] or ''),
-        'performers_df': performers_df,
-    }
-
-
 # ================================================================== #
 #  STEP 2: CURRENT MARKET PRICE                                        #
 # ================================================================== #
 def get_current_market_price(event_id: int) -> dict:
     """Most recent sale data from 75_Event_Daily."""
-    query = f"""
-    SELECT
-        PID,
-        Date                AS EventDate,
-        Report_Date,
-        Orders,
-        Avg_Order_Size,
-        Revenue,
-        DATE_DIFF(
-            SAFE.PARSE_DATE('%m/%d/%y', SUBSTR(Date, 1, 8)),
+    def _builder():
+        query = f"""
+        SELECT
+            PID,
+            Date                AS EventDate,
             Report_Date,
-            DAY
-        )                   AS days_before_event
-    FROM `data-ticketcity.TFS_Reports.75_Event_Daily`
-    WHERE PID = {event_id}
-      AND Orders > 0
-      AND Avg_Order_Size > 0
-    ORDER BY Report_Date DESC
-    LIMIT 5
-    """
-    df = client.query(query).to_dataframe()
-    if df.empty:
-        return None
+            Orders,
+            Avg_Order_Size,
+            Revenue,
+            DATE_DIFF(
+                SAFE.PARSE_DATE('%m/%d/%y', SUBSTR(Date, 1, 8)),
+                Report_Date,
+                DAY
+            )                   AS days_before_event
+        FROM `data-ticketcity.TFS_Reports.75_Event_Daily`
+        WHERE PID = {event_id}
+          AND Orders > 0
+          AND Avg_Order_Size > 0
+        ORDER BY Report_Date DESC
+        LIMIT 5
+        """
+        df = client.query(query).to_dataframe()
+        if df.empty:
+            return None
 
-    latest = df.iloc[0]
-    return {
-        'avg_order_size':    float(latest['Avg_Order_Size']),
-        'orders':            int(latest['Orders']),
-        'days_before_event': (int(latest['days_before_event'])
-                              if pd.notna(latest['days_before_event'])
-                              else None),
-        'report_date':       str(latest['Report_Date']),
-        'recent_history':    df,
-    }
+        latest = df.iloc[0]
+        return {
+            'avg_order_size': float(latest['Avg_Order_Size']),
+            'orders': int(latest['Orders']),
+            'days_before_event': (
+                int(latest['days_before_event'])
+                if pd.notna(latest['days_before_event']) else None
+            ),
+            'report_date': str(latest['Report_Date']),
+            'recent_history': df,
+        }
+
+    return cached_result(
+        prefix="market_price",
+        payload={"event_id": event_id, "today": TODAY},
+        ttl_seconds=CACHE_TTL_MARKET,
+        builder=_builder,
+    )
 
 def get_ticketcity_market_share(event_id: int, info: dict) -> dict:
     """
@@ -410,74 +562,94 @@ def get_ticketcity_market_share(event_id: int, info: dict) -> dict:
     total market listings from VividIntake.
     Returns TicketCity's share of listings and ticket count.
     """
-    query = f"""
-    SELECT
-        COUNT(*) AS tc_blocks,
-        SUM(CAST(JSON_EXTRACT_SCALAR(quantity, '$') AS INT64))
-            AS tc_tickets
-    FROM `data-ticketcity.TC_Data.TicketCity_Tickets`
-    WHERE tfs_event_id = {event_id}
-      OR CAST(tfs_event_id AS STRING) = '{event_id}'
-    """
-    try:
-        df = client.query(query).to_dataframe()
-    except Exception:
-        return None
+    def _builder():
+        query = f"""
+        SELECT
+            COUNT(*) AS tc_blocks,
+            SUM(CAST(JSON_EXTRACT_SCALAR(quantity, '$') AS INT64)) AS tc_tickets
+        FROM `data-ticketcity.TC_Data.TicketCity_Tickets`
+        WHERE tfs_event_id = {event_id}
+           OR CAST(tfs_event_id AS STRING) = '{event_id}'
+        """
+        try:
+            df = client.query(query).to_dataframe()
+        except Exception:
+            return None
 
-    if df.empty or df.iloc[0]['tc_blocks'] == 0:
-        # Try matching via axis_event_id as fallback
-        return None
+        if df.empty or df.iloc[0]['tc_blocks'] == 0:
+            return None
 
-    tc_blocks   = int(df.iloc[0]['tc_blocks']  or 0)
-    tc_tickets  = int(df.iloc[0]['tc_tickets'] or 0)
+        tc_blocks = int(df.iloc[0]['tc_blocks'] or 0)
+        tc_tickets = int(df.iloc[0]['tc_tickets'] or 0)
 
-    total_listings = int(info.get('ListingCount', 0))
-    total_tickets  = int(info.get('TicketCount',  0))
+        total_listings = int(info.get('ListingCount', 0))
+        total_tickets = int(info.get('TicketCount', 0))
 
-    listing_share = round(tc_blocks  / total_listings * 100, 1) \
-                    if total_listings > 0 else None
-    ticket_share  = round(tc_tickets / total_tickets  * 100, 1) \
-                    if total_tickets  > 0 else None
+        listing_share = round(tc_blocks / total_listings * 100, 1) if total_listings > 0 else None
+        ticket_share = round(tc_tickets / total_tickets * 100, 1) if total_tickets > 0 else None
 
-    return {
-        'tc_blocks':      tc_blocks,
-        'tc_tickets':     tc_tickets,
-        'total_listings': total_listings,
-        'total_tickets':  total_tickets,
-        'listing_share':  listing_share,
-        'ticket_share':   ticket_share,
-    }
+        return {
+            'tc_blocks': tc_blocks,
+            'tc_tickets': tc_tickets,
+            'total_listings': total_listings,
+            'total_tickets': total_tickets,
+            'listing_share': listing_share,
+            'ticket_share': ticket_share,
+        }
 
+    return cached_result(
+        prefix="tc_share",
+        payload={"event_id": event_id, "listing_count": info.get("ListingCount", 0)},
+        ttl_seconds=CACHE_TTL_TC_SHARE,
+        builder=_builder,
+    )
 # ================================================================== #
 #  STEP 3: PERFORMER LOOKUP FOR CONCERTS                               #
 # ================================================================== #
 def get_performer_event_ids_from_daily(performer_names: list) -> list:
-    if not performer_names:
+    """
+    Find historical event IDs for the same performer(s).
+    This is used mainly for concert comp matching.
+    We normalize the list so the cache key is stable.
+    """
+    performer_names = performer_names or []
+
+    clean_names = sorted(set(
+        str(x).strip() for x in performer_names if str(x).strip()
+    ))
+
+    if not clean_names:
         return []
 
-    name_conditions = " OR ".join([
-        f"LOWER(Name) LIKE '%{n.lower().replace(chr(39), chr(39)*2)}%'"
-        for n in performer_names
-    ])
+    def _builder():
+        name_conditions = " OR ".join([
+            f"LOWER(Name) LIKE '%{n.lower().replace(chr(39), chr(39)*2)}%'"
+            for n in clean_names
+        ])
 
-    query = f"""
-    SELECT DISTINCT PID
-    FROM `data-ticketcity.TFS_Reports.75_Event_Daily`
-    WHERE ({name_conditions})
-      AND Name NOT LIKE '%Test%'
-      AND Name NOT LIKE '%arking%'
-      AND Name NOT LIKE '%Tribute%'
-      AND Name NOT LIKE '%tribute%'
-      AND Name NOT LIKE '%School%'
-      AND Report_Date < '{TODAY}'
-    LIMIT 500
-    """
-    df = client.query(query).to_dataframe()
-    pids = df['PID'].tolist()
-    print(f"  → Performer lookup: {len(pids)} historical events found")
-    return pids
+        query = f"""
+        SELECT DISTINCT PID
+        FROM `data-ticketcity.TFS_Reports.75_Event_Daily`
+        WHERE ({name_conditions})
+          AND Name NOT LIKE '%Test%'
+          AND Name NOT LIKE '%arking%'
+          AND Name NOT LIKE '%Tribute%'
+          AND Name NOT LIKE '%tribute%'
+          AND Name NOT LIKE '%School%'
+          AND Report_Date < '{TODAY}'
+        LIMIT 500
+        """
+        df = client.query(query).to_dataframe()
+        pids = df['PID'].tolist()
+        print(f"  → Performer lookup: {len(pids)} historical events found")
+        return pids
 
-
+    return cached_result(
+        prefix="performer_pid_lookup",
+        payload={"performers": clean_names, "today": TODAY},
+        ttl_seconds=CACHE_TTL_PERFORMER_LOOKUP,
+        builder=_builder,
+    )
 # ================================================================== #
 #  STEP 4: COMP ENGINE                                                 #
 # ================================================================== #
@@ -600,12 +772,159 @@ def theater_fallback_comps(p, show_name_clean, min_price,
         ORDER BY similarity_score DESC, total_orders DESC
         LIMIT {n_comps}
         """
-        df = client.query(query).to_dataframe()
+        df = cached_result(
+    prefix="theater_fallback",
+    payload={
+        "event_id": int(p["EventID"]),
+        "label": label,
+        "base_name": base_name,
+        "category": p["Category_Name"],
+        "venue": p["Venue_Name"],
+        "city": p["City"],
+        "min_price": min_price,
+        "listing_low": listing_low,
+        "listing_high": listing_high,
+        "min_orders": min_orders,
+        "n_comps": n_comps,
+        "today": TODAY,
+    },
+    ttl_seconds=CACHE_TTL_COMPS,
+    builder=lambda: client.query(query).to_dataframe(),
+)
         if len(df) >= 3:
             print(f"  → Found {len(df)} comps via '{label}'")
             return df, label
 
     return pd.DataFrame(), 'none'
+
+
+def extract_name_tokens(name: str) -> list:
+    """
+    Extract significant words from an event name for same-event detection.
+    Strips noise words and short tokens so name overlap is meaningful.
+    """
+    NOISE = {
+        'game', 'event', 'show', 'match', 'live', 'concert', 'theater',
+        'theatre', 'tickets', 'series', 'week', 'season', 'night', 'tour',
+        'presents', 'featuring', 'feat', 'edition', 'games', 'with',
+        'from', 'this', 'that', 'will', 'have', 'been', 'their', 'home',
+    }
+    tokens = re.findall(r'\b[a-zA-Z]{4,}\b', name.lower())
+    return [t for t in tokens if t not in NOISE]
+
+
+def weighted_quantile(values: np.ndarray,
+                      weights: np.ndarray, q: float) -> float:
+    """Compute a weighted quantile. Handles degenerate cases gracefully."""
+    values  = np.asarray(values,  dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if len(values) == 0:
+        return float('nan')
+    if weights.sum() == 0:
+        return float(np.nanquantile(values, q))
+    idx = np.argsort(values)
+    sv  = values[idx]
+    sw  = weights[idx]
+    cw  = np.cumsum(sw)
+    pos = np.searchsorted(cw, cw[-1] * q)
+    return float(sv[min(pos, len(sv) - 1)])
+
+
+def assign_comp_tiers(comps: pd.DataFrame, target_name: str,
+                      n_total: int = 15) -> pd.DataFrame:
+    """
+    Apply a two-tier weighting system to a comp candidate pool.
+    Adds 'tier' (int) and 'weight' (float) columns to the returned DataFrame.
+
+    Tier 1 — same-event historical records (name-token overlap):
+      Identified by requiring ≥ ceil(n_tokens/2) target-name tokens to
+      appear in the comp name (minimum 2). Weight = 1.0 (full influence).
+      Requires ≥ 2 records to activate; capped at 5.
+      Detection is purely data-driven — no hardcoded names or sport types.
+
+    Tier 2 — structurally similar events by similarity score:
+      Weight decays linearly with z-score distance from the Tier 1 centroid
+      on avg_order_size and total_orders. Events > 1.5 SD from the Tier 1
+      mean on either metric are dropped entirely.
+      Fills remaining slots up to n_total.
+
+    Fallback (< 2 Tier 1 records): all comps weight = 1.0, no decay applied.
+    """
+    if comps.empty:
+        return comps
+
+    comps  = comps.copy()
+    tokens = extract_name_tokens(target_name)
+
+    def _overlap(comp_name: str) -> int:
+        cl = str(comp_name).lower()
+        return sum(1 for t in tokens if t in cl)
+
+    comps['name_overlap'] = comps['Name'].apply(_overlap)
+    t1_threshold = max(2, (len(tokens) + 1) // 2) if tokens else 9999
+
+    tier1_pool  = comps[comps['name_overlap'] >= t1_threshold].head(5)
+    tier1_valid = len(tier1_pool) >= 2
+
+    if tier1_valid:
+        tier1_ids   = set(tier1_pool['EventID'])
+        tier2_pool  = comps[~comps['EventID'].isin(tier1_ids)].copy()
+
+        t1_price_mean  = tier1_pool['avg_order_size'].mean()
+        t1_price_std   = tier1_pool['avg_order_size'].std()
+        t1_price_std   = t1_price_std   if (pd.notna(t1_price_std)  and t1_price_std  > 0) else 0.0
+        t1_orders_mean = tier1_pool['total_orders'].mean()
+        t1_orders_std  = tier1_pool['total_orders'].std()
+        t1_orders_std  = t1_orders_std  if (pd.notna(t1_orders_std) and t1_orders_std > 0) else 0.0
+
+        keep_idx   = []
+        weight_map = {}
+        for idx, row in tier2_pool.iterrows():
+            z_price  = (abs(row['avg_order_size'] - t1_price_mean) / t1_price_std
+                        if t1_price_std > 0 else 0.0)
+            z_orders = (abs(row['total_orders'] - t1_orders_mean) / t1_orders_std
+                        if t1_orders_std > 0 else 0.0)
+            z_max = max(z_price, z_orders)
+            if z_max > 1.5:
+                continue
+            weight_map[idx] = round(max(0.3, 1.0 - z_max / 3.0), 3)
+            keep_idx.append(idx)
+
+        n_tier2_slots = n_total - len(tier1_pool)
+        selected_idx  = keep_idx[:n_tier2_slots]
+        n_dropped     = len(tier2_pool) - len(keep_idx)
+
+        tier1_df           = tier1_pool.copy()
+        tier1_df['tier']   = 1
+        tier1_df['weight'] = 1.0
+
+        if selected_idx:
+            tier2_df           = tier2_pool.loc[selected_idx].copy()
+            tier2_df['tier']   = 2
+            tier2_df['weight'] = [weight_map[i] for i in selected_idx]
+        else:
+            tier2_df = pd.DataFrame(columns=tier1_df.columns)
+
+        print(f"  Tier 1 (same-event):  {len(tier1_df)} events  "
+              f"[matched tokens: {tokens}]")
+        print(f"  Tier 2 (structural):  {len(selected_idx)} events  "
+              f"({n_dropped} dropped by >1.5 SD filter from "
+              f"{len(tier2_pool)} candidates)")
+
+        return pd.concat([tier1_df, tier2_df], ignore_index=True)
+
+    else:
+        n_t1_found = len(comps[comps['name_overlap'] >= t1_threshold])
+        if n_t1_found == 1:
+            print(f"  Tier fallback: only 1 same-event record found "
+                  f"(need ≥ 2) — using uniform weights")
+        else:
+            print(f"  Tier fallback: no same-event history found "
+                  f"— using uniform weights for all comps")
+        result           = comps.head(n_total).copy()
+        result['tier']   = 2
+        result['weight'] = 1.0
+        return result
 
 
 def find_comps(event_id: int,
@@ -675,6 +994,17 @@ def find_comps(event_id: int,
     if mode in ['concert', 'theater']:
         exclusions += AMATEUR_EXCLUSIONS
         exclusions += TRIBUTE_EXCLUSIONS
+        # Exclude festivals from solo/theater comps (and vice versa).
+        # Check both the VividIntake category and the event name so
+        # cross-categorized events (e.g. a festival filed under "Hip Hop")
+        # are handled correctly.
+        name_lower = p.get('Name', '').lower()
+        is_festival_target = (
+            p.get('Category_Name') == 'Music Festivals'
+            or any(kw in name_lower for kw in _FESTIVAL_KEYWORDS)
+        )
+        if not is_festival_target:
+            exclusions += FESTIVAL_EXCLUSIONS
 
     if mode == 'annual' and golf_round in ['weekend', 'weekday']:
         exclusions += PRACTICE_ROUND_EXCLUSIONS
@@ -757,7 +1087,9 @@ def find_comps(event_id: int,
                      THEN 3 ELSE 0 END +
                 CASE WHEN total_orders > 300 THEN 2 ELSE 0 END +
                 CASE WHEN last_report >= '{RECENCY_CUTOFF}' THEN 1 ELSE 0 END +
-                CASE WHEN City = '{p['City']}' THEN 1 ELSE 0 END
+                CASE WHEN City = '{p['City']}' THEN 1 ELSE 0 END +
+                CASE WHEN Venue = '{p['Venue_Name'].replace(chr(39), chr(39)*2)}'
+                     THEN 2 ELSE 0 END
             """
 
         elif sport_sub in ['quarterfinal', 'tournament_early']:
@@ -773,7 +1105,9 @@ def find_comps(event_id: int,
                                              AND {price_anchor*4.0}
                      THEN 3 ELSE 0 END +
                 CASE WHEN total_orders > 100 THEN 2 ELSE 0 END +
-                CASE WHEN City = '{p['City']}' THEN 1 ELSE 0 END
+                CASE WHEN City = '{p['City']}' THEN 1 ELSE 0 END +
+                CASE WHEN Venue = '{p['Venue_Name'].replace(chr(39), chr(39)*2)}'
+                     THEN 2 ELSE 0 END
             """
 
         else:
@@ -790,15 +1124,34 @@ def find_comps(event_id: int,
                 if away_team else "0"
             )
 
+            venue_safe = p['Venue_Name'].replace(chr(39), chr(39)*2) if p.get('Venue_Name') else ''
+            city_safe  = p['City'].replace(chr(39), chr(39)*2)
+
             if home_word:
+                # Require same city OR same venue — "same city" catches home-team
+                # games at their usual stadium; "same venue" catches neutral-site
+                # rivalry games (Cotton Bowl, Jerry World) where the venue is the
+                # stable anchor even when the host city is shared by both fanbases.
+                geo_clause = f"City = '{city_safe}'"
+                if venue_safe:
+                    geo_clause += f" OR Venue = '{venue_safe}'"
                 name_filter = (
                     f"AND LOWER(Name) LIKE '%{home_word.lower()}%'"
+                    f"\nAND ({geo_clause})"
                 )
+            elif venue_safe:
+                # No home team identified (master performer unset — common for
+                # neutral-site NCAA games).  Fall back to same-venue constraint so
+                # we at least anchor to the specific stadium rather than letting
+                # every same-category event in the country pass through.
+                name_filter = f"AND Venue = '{venue_safe}'"
 
             scoring = f"""
                 {home_case} +
                 {away_case} +
                 CASE WHEN City = '{p['City']}' THEN 2 ELSE 0 END +
+                CASE WHEN Venue = '{p['Venue_Name'].replace(chr(39), chr(39)*2)}'
+                     THEN 3 ELSE 0 END +
                 CASE WHEN avg_order_size BETWEEN {price_anchor*0.4}
                                              AND {price_anchor*2.5}
                      THEN 3 ELSE 0 END +
@@ -938,10 +1291,31 @@ def find_comps(event_id: int,
     FROM deduped
     WHERE rn = 1
     ORDER BY similarity_score DESC, total_orders DESC
-    LIMIT {n_comps}
+    LIMIT {n_comps * 3}
     """
 
-    comps = client.query(comps_query).to_dataframe()
+    comps = cached_result(
+    prefix="find_comps",
+    payload={
+        "event_id": event_id,
+        "category": category,
+        "name": name,
+        "mode": mode,
+        "venue_tier": venue_tier,
+        "gender": gender,
+        "sport_sub": sport_sub,
+        "tour_tier": tour_tier,
+        "golf_round": golf_round,
+        "listing_low": listing_low,
+        "listing_high": listing_high,
+        "market_price": market_price,
+        "n_comps": n_comps,
+        "partition": PARTITION,
+        "today": TODAY,
+    },
+    ttl_seconds=CACHE_TTL_COMPS,
+    builder=lambda: client.query(comps_query).to_dataframe(),
+)
 
     # Filter future concert events
     if mode == 'concert' and not comps.empty:
@@ -970,18 +1344,28 @@ def find_comps(event_id: int,
             excl_sql, min_orders, n_comps
         )
 
+    # ── Tier assignment (data-driven, event-agnostic) ─────────────── #
+    print(f"\n⚖️  Assigning comp tiers...")
+    comps = assign_comp_tiers(comps, name, n_total=n_comps)
+
     confidence, conf_notes = evaluate_confidence(
         comps, venue_tier, mode, listings
     )
 
-    print(f"\nTOP {len(comps)} COMPS "
-          f"[{mode.upper()} | {venue_tier.upper()}"
-          f"{' | fallback: ' + fallback_used if fallback_used else ''}]:")
+    print(f"\nCOMP SELECTION [{mode.upper()} | {venue_tier.upper()}"
+          f"{' | fallback: ' + fallback_used if fallback_used else ''}]  "
+          f"— {len(comps)} events used in model:")
 
     if not comps.empty:
-        print(comps[['EventID', 'Name', 'EventDate', 'City',
-                      'total_orders', 'avg_order_size',
-                      'similarity_score']].to_string())
+        disp = comps[['tier', 'weight', 'EventID', 'Name', 'EventDate',
+                      'City', 'total_orders', 'avg_order_size',
+                      'similarity_score']].copy()
+        disp = disp.rename(columns={
+            'tier': 'T', 'weight': 'Wt',
+            'total_orders': 'orders', 'avg_order_size': 'avg_$',
+            'similarity_score': 'score',
+        })
+        print(disp.to_string(index=False))
     else:
         print("  No comps found.")
 
@@ -1000,50 +1384,60 @@ def pull_daily_trajectories(comp_event_ids: list) -> pd.DataFrame:
     if not comp_event_ids:
         return pd.DataFrame()
 
-    ids_str = ", ".join(str(i) for i in comp_event_ids)
+    comp_event_ids = sorted(set(int(i) for i in comp_event_ids if pd.notna(i)))
 
-    query = f"""
-    SELECT
-        PID                     AS EventID,
-        Date                    AS EventDate,
-        Report_Date,
-        Orders,
-        Avg_Order_Size,
-        DATE_DIFF(
-            SAFE.PARSE_DATE('%m/%d/%y', SUBSTR(Date, 1, 8)),
+    def _builder():
+        ids_str = ", ".join(str(i) for i in comp_event_ids)
+
+        query = f"""
+        SELECT
+            PID                     AS EventID,
+            Date                    AS EventDate,
             Report_Date,
-            DAY
-        )                       AS days_before_event
-    FROM `data-ticketcity.TFS_Reports.75_Event_Daily`
-    WHERE PID IN ({ids_str})
-      AND Orders > 0
-      AND Avg_Order_Size > 0
-      AND Avg_Order_Size < 50000
-      AND NOT (
-          LOWER(Name) LIKE '%festival%'
-          OR LOWER(Name) LIKE '%outlaw%'
-          OR LOWER(Name) LIKE '%when we were young%'
-          OR LOWER(Name) LIKE '%lollapalooza%'
-          OR LOWER(Name) LIKE '%coachella%'
-          OR LOWER(Name) LIKE '%bonnaroo%'
-      )
-    ORDER BY PID, Report_Date ASC
-    """
+            Orders,
+            Avg_Order_Size,
+            DATE_DIFF(
+                SAFE.PARSE_DATE('%m/%d/%y', SUBSTR(Date, 1, 8)),
+                Report_Date,
+                DAY
+            )                       AS days_before_event
+        FROM `data-ticketcity.TFS_Reports.75_Event_Daily`
+        WHERE PID IN ({ids_str})
+          AND Orders > 0
+          AND Avg_Order_Size > 0
+          AND Avg_Order_Size < 50000
+          AND NOT ({' OR '.join(f"LOWER(Name) LIKE LOWER('{p}')" for p in FESTIVAL_EXCLUSIONS)})
+        ORDER BY PID, Report_Date ASC
+        """
 
-    job = client.query(query)
-    df  = job.to_dataframe()
-    mb  = job.total_bytes_processed / 1024**2
+        job = client.query(query)
+        df = job.to_dataframe()
+
+        if df.empty:
+            return pd.DataFrame()
+
+        df = df[
+            (df['days_before_event'] >= 0) &
+            (df['days_before_event'] <= 730)
+        ].copy()
+
+        return df
+
+    df = cached_result(
+        prefix="price_trajectories",
+        payload={
+            "comp_event_ids": comp_event_ids,
+            "today": TODAY,
+        },
+        ttl_seconds=CACHE_TTL_TRAJECTORIES,
+        builder=_builder,
+    )
 
     if df.empty:
         return pd.DataFrame()
 
-    df = df[
-        (df['days_before_event'] >= 0) &
-        (df['days_before_event'] <= 730)
-    ].copy()
-
     print(f"  Trajectory data: {len(df):,} rows | "
-          f"{df['EventID'].nunique()} events | {mb:.1f} MB")
+          f"{df['EventID'].nunique()} events")
     return df
 
 def compute_sellthrough_metrics(df: pd.DataFrame) -> pd.DataFrame:
@@ -1267,7 +1661,19 @@ def normalize_trajectories(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_aggregate_curves(df: pd.DataFrame,
-                           bucket_size: int = 7) -> pd.DataFrame:
+                           bucket_size: int = 7,
+                           comp_weights: dict = None) -> pd.DataFrame:
+    """
+    Build weekly-bucketed price-index curves from normalized trajectory data.
+
+    When comp_weights is provided (EventID → float), applies event-level
+    weighted aggregation: per-event medians per bucket are first computed,
+    then weighted quantiles are derived across events.  This ensures Tier 1
+    (same-event history, weight=1.0) drives the curve more strongly than
+    downweighted Tier 2 structural comps.
+
+    Without comp_weights, falls back to the original unweighted path.
+    """
     if df.empty:
         return pd.DataFrame()
 
@@ -1276,22 +1682,62 @@ def build_aggregate_curves(df: pd.DataFrame,
         (df['days_before_event'] // bucket_size) * bucket_size
     )
 
-    curves = (
-        df.groupby('day_bucket')
+    if not comp_weights:
+        # Unweighted path — original behavior
+        curves = (
+            df.groupby('day_bucket')
+              .agg(
+                  n_events           = ('EventID',        'nunique'),
+                  median_price_index = ('price_index',    'median'),
+                  p25_price_index    = ('price_index',
+                                        lambda x: x.quantile(0.25)),
+                  p75_price_index    = ('price_index',
+                                        lambda x: x.quantile(0.75)),
+                  median_price       = ('Avg_Order_Size', 'median'),
+                  median_orders      = ('Orders',         'median'),
+              )
+              .reset_index()
+              .sort_values('day_bucket', ascending=False)
+        )
+        return curves[curves['n_events'] >= 2].copy()
+
+    # Weighted path
+    # Step 1: collapse each (bucket, event) to a single median value so that
+    # events with many report-date rows don't get extra influence.
+    per_event = (
+        df.groupby(['day_bucket', 'EventID'])
           .agg(
-              n_events           = ('EventID',        'nunique'),
-              median_price_index = ('price_index',    'median'),
-              p25_price_index    = ('price_index',
-                                    lambda x: x.quantile(0.25)),
-              p75_price_index    = ('price_index',
-                                    lambda x: x.quantile(0.75)),
-              median_price       = ('Avg_Order_Size', 'median'),
-              median_orders      = ('Orders',         'median'),
+              evt_price_index = ('price_index',    'median'),
+              evt_price       = ('Avg_Order_Size', 'median'),
+              evt_orders      = ('Orders',         'median'),
           )
           .reset_index()
-          .sort_values('day_bucket', ascending=False)
+    )
+    per_event['weight'] = (
+        per_event['EventID'].map(comp_weights).fillna(1.0)
     )
 
+    # Step 2: weighted quantiles across events per bucket
+    results = []
+    for bucket, grp in per_event.groupby('day_bucket'):
+        n = len(grp)
+        if n < 2:
+            continue
+        vals = grp['evt_price_index'].values
+        wts  = grp['weight'].values
+        results.append({
+            'day_bucket':         int(bucket),
+            'n_events':           n,
+            'median_price_index': weighted_quantile(vals, wts, 0.50),
+            'p25_price_index':    weighted_quantile(vals, wts, 0.25),
+            'p75_price_index':    weighted_quantile(vals, wts, 0.75),
+            'median_price':       float(grp['evt_price'].median()),
+            'median_orders':      float(grp['evt_orders'].median()),
+        })
+
+    if not results:
+        return pd.DataFrame()
+    curves = pd.DataFrame(results).sort_values('day_bucket', ascending=False)
     return curves[curves['n_events'] >= 2].copy()
 
 
@@ -1350,7 +1796,24 @@ def generate_recommendation(
         return {
             'recommendation': 'INSUFFICIENT_DATA',
             'reasoning': 'Not enough historical comp data.',
-            'predictions': {}
+            'predictions': {},
+
+            # keys expected later by print_report() and frontend.py
+            'current_price': round(current_price, 2),
+            'baseline_price': round(current_price, 2),
+            'days_remaining': int(days_before_event),
+
+            'peak_price': round(current_price, 2),
+            'peak_day': int(days_before_event),
+            'trough_price': round(current_price, 2),
+            'day0_price': round(current_price, 2),
+
+            'upside_pct': 0.0,
+            'downside_pct': 0.0,
+            'day0_pct': 0.0,
+            'day0_p25_price': round(current_price, 2),
+            'day0_p25_pct': 0.0,
+            'realized_decline_pct': 0.0,
         }
     
     # Sports fans routinely buy within the final week — a 30-40% day-of
@@ -1377,12 +1840,44 @@ def generate_recommendation(
         trough_row   = future.loc[future['abs_price'].idxmin()]
         trough_price = float(trough_row['abs_price'])
 
-    day0_price = float(get_nearest_row(traj, 0)['price_index_smooth']) \
-                 * baseline
+    day0_row   = get_nearest_row(traj, 0)
+    day0_price = float(day0_row['price_index_smooth']) * baseline
 
-    upside_pct   = ((peak_price   - current_price) / current_price) * 100
-    downside_pct = ((trough_price - current_price) / current_price) * 100
-    day0_pct     = ((day0_price   - current_price) / current_price) * 100
+    # p25 at day-0: the lower quartile of comp outcomes at event day.
+    # 75_Event_Daily captures daily *averages*, so the median day0_price
+    # is already smoothed — last-minute panic/distress sales are not
+    # reflected.  The p25 floor gives a data-grounded lower bound:
+    # "1-in-4 comparable events ended up at or below this price by
+    # event day."  Use for risk display only — not as the model anchor.
+    day0_p25_price = float(day0_row['p25_index']) * baseline
+
+    upside_pct    = ((peak_price    - current_price) / current_price) * 100
+    downside_pct  = ((trough_price  - current_price) / current_price) * 100
+    day0_pct      = ((day0_price    - current_price) / current_price) * 100
+    day0_p25_pct  = ((day0_p25_price - current_price) / current_price) * 100
+
+    # ── Full trajectory quality metrics ─────────────────────────────
+    # trajectory_quality: average future price vs current — tells you whether
+    # the path as a whole is above or below where you are today.
+    # near_term_pct: price 30 calendar days from now vs current — tells you
+    # whether the trajectory is still rising (positive) or falling (negative)
+    # from this point, so HOLD vs SELL can be anchored to the near-term slope
+    # rather than relying solely on the distant peak.
+    if not future.empty:
+        trajectory_quality = (
+            (future['abs_price'].mean() - current_price) / current_price * 100
+        )
+        near_term_day = max(0, days_before_event - 30)
+        near_row      = get_nearest_row(traj, near_term_day)
+        near_term_price = float(near_row['price_index_smooth']) * baseline
+        near_term_pct   = (near_term_price - current_price) / current_price * 100
+        # Days (in the future horizon) where price sits above current
+        peak_window_days = int((future['abs_price'] >= current_price * 0.98).sum())
+    else:
+        trajectory_quality = 0.0
+        near_term_pct      = 0.0
+        near_term_price    = current_price
+        peak_window_days   = 0
 
     # Realized decline since the prior checkpoint.
     # The model recalibrates its baseline from current price each call, so
@@ -1465,9 +1960,11 @@ def generate_recommendation(
             'peak_day':            peak_day,
             'trough_price':        round(trough_price, 2),
             'day0_price':          round(day0_price, 2),
+            'day0_p25_price':      round(day0_p25_price, 2),
             'upside_pct':          round(upside_pct, 1),
             'downside_pct':        round(downside_pct, 1),
             'day0_pct':            round(day0_pct, 1),
+            'day0_p25_pct':        round(day0_p25_pct, 1),
             'realized_decline_pct': round(realized_decline_pct, 1),
             'predictions':         predictions,
             **pnl,
@@ -1503,9 +2000,11 @@ def generate_recommendation(
             'peak_day':            peak_day,
             'trough_price':        round(trough_price, 2),
             'day0_price':          round(day0_price, 2),
+            'day0_p25_price':      round(day0_p25_price, 2),
             'upside_pct':          round(upside_pct, 1),
             'downside_pct':        round(downside_pct, 1),
             'day0_pct':            round(day0_pct, 1),
+            'day0_p25_pct':        round(day0_p25_pct, 1),
             'realized_decline_pct': round(realized_decline_pct, 1),
             'predictions':         predictions,
             **pnl,
@@ -1522,6 +2021,10 @@ def generate_recommendation(
         f" Note: Peak window is only {hold_days} days away — act quickly."
         if hold_days <= 21 else ""
     )
+    window_note = (
+        f" Hold window: ~{peak_window_days} days above current price."
+        if peak_window_days > 0 else ""
+    )
 
     if poor_rr:
         rec = 'SELL_NOW'
@@ -1533,19 +2036,40 @@ def generate_recommendation(
             f"{support_note}{uncertainty}"
         )
     elif upside_pct >= 10 and peak_day > 7:
-        rec = 'HOLD'
-        reasoning = (
-            f"Price trajectory shows appreciation to ${peak_price:.0f} "
-            f"(+{upside_pct:.1f}%) around {peak_day} days before event. "
-            f"{support_note}{uncertainty}{timing_note}"
-        )
+        # Demote to MONITOR when the near-term slope is already negative
+        # (trajectory declining from current position → no runway left to peak)
+        if near_term_pct < -5:
+            rec = 'MONITOR'
+            reasoning = (
+                f"Price peak at ${peak_price:.0f} (+{upside_pct:.1f}%) exists at "
+                f"day {peak_day}, but near-term trajectory is declining "
+                f"({near_term_pct:+.1f}% in next 30 days). "
+                f"Peak may be behind you — re-evaluate before acting. "
+                f"{support_note}{uncertainty}"
+            )
+        else:
+            rec = 'HOLD'
+            reasoning = (
+                f"Price trajectory shows appreciation to ${peak_price:.0f} "
+                f"(+{upside_pct:.1f}%) around {peak_day} days before event. "
+                f"{support_note}{uncertainty}{timing_note}{window_note}"
+            )
     elif upside_pct >= 5 and peak_day > 14:
-        rec = 'HOLD'
-        reasoning = (
-            f"Modest upside to ${peak_price:.0f} (+{upside_pct:.1f}%) "
-            f"at {peak_day} days out. Downside {downside_pct:.1f}%. "
-            f"{support_note}{uncertainty}{timing_note}"
-        )
+        if near_term_pct < -5:
+            rec = 'MONITOR'
+            reasoning = (
+                f"Modest peak at ${peak_price:.0f} (+{upside_pct:.1f}%) but "
+                f"near-term direction is negative ({near_term_pct:+.1f}% in 30 days). "
+                f"Trajectory quality: {trajectory_quality:+.1f}% avg vs current. "
+                f"Re-evaluate in 14 days. {support_note}{uncertainty}"
+            )
+        else:
+            rec = 'HOLD'
+            reasoning = (
+                f"Modest upside to ${peak_price:.0f} (+{upside_pct:.1f}%) "
+                f"at {peak_day} days out. Downside {downside_pct:.1f}%. "
+                f"{support_note}{uncertainty}{timing_note}{window_note}"
+            )
     elif day0_pct < day0_decay_threshold:
         # Severe endpoint decay overrides any mid-trajectory peak.
         rec = 'SELL_NOW'
@@ -1613,10 +2137,15 @@ def generate_recommendation(
         'peak_day':             peak_day,
         'trough_price':         round(trough_price, 2),
         'day0_price':           round(day0_price, 2),
+        'day0_p25_price':       round(day0_p25_price, 2),
         'upside_pct':           round(upside_pct, 1),
         'downside_pct':         round(downside_pct, 1),
         'day0_pct':             round(day0_pct, 1),
+        'day0_p25_pct':         round(day0_p25_pct, 1),
         'realized_decline_pct': round(realized_decline_pct, 1),
+        'trajectory_quality':   round(trajectory_quality, 1),
+        'near_term_pct':        round(near_term_pct, 1),
+        'peak_window_days':     peak_window_days,
         'predictions':          predictions,
         **pnl,
     }
@@ -1791,7 +2320,8 @@ def print_report(info: dict, comps: pd.DataFrame,
                   f" no meaningful upside remaining")
         print(f"  Wait till day-of: ${rec['day0_price']:.2f}  "
               f"→  {rec['day0_profit_pct']:+.1f}%  "
-              f"(${rec['day0_profit_abs']:+.2f} profit)")
+              f"(${rec['day0_profit_abs']:+.2f} profit)  "
+              f"[floor risk: ${rec['day0_p25_price']:.0f} p25]")
 
     peak_label = (
         "(no future upside — at or past peak)"
@@ -1801,6 +2331,9 @@ def print_report(info: dict, comps: pd.DataFrame,
     print(f"\n  Peak window:  ${rec['peak_price']:.2f} — {peak_label}")
     print(f"  Day-of price: ${rec['day0_price']:.2f} "
           f"({rec['day0_pct']:+.1f}% vs now)")
+    print(f"  Day-of floor: ${rec['day0_p25_price']:.2f} "
+          f"({rec['day0_p25_pct']:+.1f}% vs now)  "
+          f"[p25 — 1-in-4 comps ended at or below this]")
     print(f"{'='*65}\n")
 
     print(f"\n🎫 YOUR POSITION")
@@ -1860,52 +2393,63 @@ def get_inventory_snapshots(
 
     InventoryStream is safe for this because we always filter by exact EventID.
     """
+    # Bucket the cutoff to the current calendar day so the cache key is stable
+    # within a single day — sub-day cache misses would re-bill InventoryStream
+    # unnecessarily (23MB per query).
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     cutoff_unix = int(cutoff_dt.timestamp())
 
-    query = f"""
-    WITH base AS (
+    def _query():
+        query = f"""
+        WITH base AS (
+            SELECT
+                SnapshotId,
+                Time,
+                TIMESTAMP_SECONDS(Time)                AS snapshot_ts,
+                DATE(TIMESTAMP_SECONDS(Time))          AS snapshot_date,
+                EventID,
+                DataSource,
+                BlockId,
+                SectionName,
+                Row,
+                CAST(Quantity AS INT64)               AS Quantity,
+                CAST(Price AS FLOAT64)                AS Price,
+                StockType
+            FROM `data-ticketcity.TC_Data.InventoryStream`
+            WHERE EventID = {event_id}
+              AND Time >= {cutoff_unix}
+              AND Price > 0
+              AND Price < 50000
+              AND Quantity > 0
+        )
         SELECT
             SnapshotId,
             Time,
-            TIMESTAMP_SECONDS(Time)                AS snapshot_ts,
-            DATE(TIMESTAMP_SECONDS(Time))          AS snapshot_date,
+            snapshot_ts,
+            snapshot_date,
             EventID,
             DataSource,
             BlockId,
             SectionName,
             Row,
-            CAST(Quantity AS INT64)               AS Quantity,
-            CAST(Price AS FLOAT64)                AS Price,
+            Quantity,
+            Price,
             StockType
-        FROM `data-ticketcity.TC_Data.InventoryStream`
-        WHERE EventID = {event_id}
-          AND Time >= {cutoff_unix}
-          AND Price > 0
-          AND Price < 50000
-          AND Quantity > 0
+        FROM base
+        ORDER BY snapshot_ts ASC
+        """
+        result = client.query(query).to_dataframe()
+        return result if not result.empty else pd.DataFrame()
+
+    df = cached_result(
+        prefix="inventory_snapshots",
+        payload={"event_id": event_id, "lookback_days": lookback_days, "date": today_str},
+        ttl_seconds=CACHE_TTL_SECTION,
+        builder=_query,
     )
-    SELECT
-        SnapshotId,
-        Time,
-        snapshot_ts,
-        snapshot_date,
-        EventID,
-        DataSource,
-        BlockId,
-        SectionName,
-        Row,
-        Quantity,
-        Price,
-        StockType
-    FROM base
-    ORDER BY snapshot_ts ASC
-    """
 
-    job = client.query(query)
-    df = job.to_dataframe()
-
-    if df.empty:
+    if df is None or df.empty:
         return pd.DataFrame()
 
     df["section_group"] = df["SectionName"].apply(classify_section)
@@ -2237,23 +2781,33 @@ def classify_decay_risk(comp_ids: list) -> dict:
     if not comp_ids:
         return {"decay_class": "UNKNOWN", "timing_flag": "UNKNOWN", "guidance": "No comp data."}
 
-    ids_str = ", ".join(str(i) for i in comp_ids)
-    query = f"""
-    SELECT
-        PID AS event_id,
-        Avg_Order_Size AS price,
-        Orders,
-        DATE_DIFF(
-            SAFE.PARSE_DATE('%m/%d/%y', SUBSTR(Date, 1, 8)),
-            Report_Date, DAY
-        ) AS days_before_event
-    FROM `data-ticketcity.TFS_Reports.75_Event_Daily`
-    WHERE PID IN ({ids_str})
-      AND Orders > 0 AND Avg_Order_Size > 0
-    ORDER BY PID, Report_Date ASC
-    """
-    df = client.query(query).to_dataframe()
-    df = df[(df["days_before_event"] >= 0) & (df["days_before_event"] <= 365)]
+    sorted_ids = sorted(comp_ids)
+
+    def _query():
+        ids_str = ", ".join(str(i) for i in sorted_ids)
+        query = f"""
+        SELECT
+            PID AS event_id,
+            Avg_Order_Size AS price,
+            Orders,
+            DATE_DIFF(
+                SAFE.PARSE_DATE('%m/%d/%y', SUBSTR(Date, 1, 8)),
+                Report_Date, DAY
+            ) AS days_before_event
+        FROM `data-ticketcity.TFS_Reports.75_Event_Daily`
+        WHERE PID IN ({ids_str})
+          AND Orders > 0 AND Avg_Order_Size > 0
+        ORDER BY PID, Report_Date ASC
+        """
+        result = client.query(query).to_dataframe()
+        return result[(result["days_before_event"] >= 0) & (result["days_before_event"] <= 365)]
+
+    df = cached_result(
+        prefix="decay_risk",
+        payload={"comp_ids": sorted_ids},
+        ttl_seconds=CACHE_TTL_DECAY,
+        builder=_query,
+    )
 
     if df.empty:
         return {"decay_class": "UNKNOWN", "timing_flag": "UNKNOWN", "guidance": "No trajectory data."}
@@ -2275,7 +2829,9 @@ def classify_decay_risk(comp_ids: list) -> dict:
             continue
         early_pct = float(g[g["days_before_event"] >= 60]["Orders"].sum() / total_orders * 100)
         late_pct  = float(g[g["days_before_event"] <= 14]["Orders"].sum() / total_orders * 100)
-        peak_uplift = float((g["price"].max() - baseline) / baseline * 100)
+        # Use 90th-percentile price instead of raw max to avoid single-sale outlier
+        # inflating the peak figure (e.g. one spike at $2000 in a $300 comp pool)
+        peak_uplift = float((g["price"].quantile(0.90) - baseline) / baseline * 100)
         decay_pcts.append(((day0_price - baseline) / baseline) * 100)
         early_pcts.append(early_pct)
         late_pcts.append(late_pct)
@@ -2350,6 +2906,66 @@ def classify_decay_risk(comp_ids: list) -> dict:
         "med_peak_uplift": round(med_peak, 1),
     }
 # ================================================================== #
+#  DECAY RECONCILIATION HELPER                                         #
+# ================================================================== #
+def reconcile_decay_with_rec(rec: dict, decay: dict) -> dict:
+    """
+    Align the decay timing_flag with the fitted price trajectory in rec.
+
+    classify_decay_risk only sees comp aggregates and doesn't know whether
+    the current listed price is already above or below the fitted peak.
+    This reconciliation handles both correction directions:
+      A) HOLD_THROUGH_PEAK but trajectory has no upside → downgrade
+      B) SELL_EARLY_REQUIRED but trajectory shows a real price peak → upgrade
+
+    Operates on a copy of decay — does not mutate the input.
+    """
+    decay = copy.deepcopy(decay)
+    if not decay or not rec:
+        return decay
+
+    if decay.get('timing_flag') == 'HOLD_THROUGH_PEAK':
+        upside   = rec.get('upside_pct', 0)
+        day0_pct = rec.get('day0_pct', 0)
+        med_peak = decay.get('med_peak_uplift', 0)
+        if upside <= 0:
+            if day0_pct <= -10:
+                decay['timing_flag'] = 'SELL_EARLY_REQUIRED'
+                decay['guidance'] = (
+                    f"Comps historically peak ~{med_peak:.0f}% above baseline, but your "
+                    f"current price already reflects that premium. The fitted trajectory "
+                    f"shows {abs(day0_pct):.1f}% downside by event day — sell now to "
+                    f"capture current value rather than waiting for a peak that has passed."
+                )
+            else:
+                decay['timing_flag'] = 'SELL_ANYTIME'
+                decay['guidance'] = (
+                    f"Comps historically peak ~{med_peak:.0f}% above baseline, but your "
+                    f"current price is already at the forecast peak level. "
+                    f"Sell timing is flexible — no further material upside expected."
+                )
+
+    elif (decay.get('timing_flag') == 'SELL_EARLY_REQUIRED'
+          and rec.get('recommendation') == 'HOLD'):
+        upside   = rec.get('upside_pct', 0)
+        peak_day = rec.get('peak_day', 0)
+        day0_pct = rec.get('day0_pct', 0)
+        days_rem = rec.get('days_remaining', 0)
+        win_days = rec.get('peak_window_days', 0)
+        if upside >= 5 and peak_day > 7:
+            hold_for = days_rem - peak_day
+            decay['timing_flag'] = 'HOLD_THROUGH_PEAK'
+            decay['guidance'] = (
+                f"Price trajectory shows a peak of +{upside:.1f}% at day {peak_day}. "
+                f"Hold ~{hold_for} more days to capture the peak, then sell "
+                f"(~{win_days} days in the above-current window). "
+                f"Day-of price decays to {day0_pct:.1f}% — do not hold past the peak."
+            )
+
+    return decay
+
+
+# ================================================================== #
 #  MAIN PIPELINE                                                       #
 # ================================================================== #
 def run_pipeline(event_id: int,
@@ -2377,9 +2993,18 @@ def run_pipeline(event_id: int,
     if listed_price:
         current_price = listed_price
         print(f"   Your listed price:      ${current_price:.2f}")
+    elif market and market.get('avg_order_size'):
+        # Default to recent average sale price — more representative than
+        # MinPrice (get-in price), which anchors the model too low
+        current_price = float(market['avg_order_size'])
+        print(f"   Using market avg sale as default: ${current_price:.2f}")
     else:
-        current_price = float(info['MinPrice'])
-        print(f"   Using MinPrice as default: ${current_price:.2f}")
+        # Fallback: midpoint of listing range when no sale history exists
+        min_p = float(info['MinPrice'])
+        max_p = float(info['MaxPrice'])
+        current_price = (min_p + max_p) / 2 if max_p > min_p else min_p
+        print(f"   Using listing midpoint as default: ${current_price:.2f} "
+              f"(min ${min_p:.0f} / max ${max_p:.0f})")
 
     # Days before event — always from actual event date
     try:
@@ -2427,8 +3052,23 @@ def run_pipeline(event_id: int,
         print(f"\n⚠️  CATEGORY WARNING: {info['Category_Name']} has structurally "
               f"unreliable comp pools. Treat recommendation as directional only.")
 
-    # Cache check
-    comp_hash  = abs(hash(tuple(sorted(comps['EventID'].tolist())))) % 100000
+    # Build comp weights dict (EventID → weight) for weighted curve building
+    comp_weights = (
+        dict(zip(comps['EventID'].astype(int),
+                 comps['weight'].astype(float)))
+        if 'weight' in comps.columns else None
+    )
+
+    # Cache hash — includes weight signature so re-tiering invalidates cache
+    if comp_weights:
+        weight_sig = tuple(
+            (int(eid), round(float(w), 2))
+            for eid, w in sorted(comp_weights.items())
+        )
+        comp_hash = abs(hash(weight_sig)) % 100000
+    else:
+        comp_hash = abs(hash(tuple(sorted(comps['EventID'].tolist())))) % 100000
+
     cache_path = TRAJECTORIES_DIR / f"{event_id}_{comp_hash}_curves.parquet"
     norm_path  = TRAJECTORIES_DIR / f"{event_id}_{comp_hash}_norm.parquet"
 
@@ -2458,7 +3098,7 @@ def run_pipeline(event_id: int,
             print("❌ No trajectory data found.")
             return {}
         norm_df = normalize_trajectories(raw_df)
-        curves  = build_aggregate_curves(norm_df)
+        curves  = build_aggregate_curves(norm_df, comp_weights=comp_weights)
         curves.to_parquet(cache_path, index=False)
         norm_df.to_parquet(norm_path, index=False)
         comps.to_csv(
@@ -2498,14 +3138,29 @@ def run_pipeline(event_id: int,
     demand = compute_demand_signal(curves, days_before, st_summary)
     print(f"   Demand signal: {demand['signal']}")
 
-    # ── Decay risk classification ─────────────────────────────────
+    # ── Decay risk classification — Tier 1 comps only ─────────────
+    # Using Tier 1 (same-event history) for decay gives a signal specific to THIS
+    # event's price dynamics rather than generic structural comps.
+    # Falls back to all comps if fewer than 2 Tier 1 records exist.
     print(f"\n⏳ Classifying decay risk...")
-    comp_ids_for_decay = comps['EventID'].tolist() if not comps.empty else []
-    decay = classify_decay_risk(comp_ids_for_decay)
-    print(f"   Decay class: {decay['decay_class']} | Flag: {decay['timing_flag']}")
+    tier1_ids = (
+        comps[comps['tier'] == 1]['EventID'].tolist()
+        if 'tier' in comps.columns else []
+    )
+    comp_ids_for_decay = (
+        tier1_ids if len(tier1_ids) >= 2 else comps['EventID'].tolist()
+    )
+    if len(tier1_ids) >= 2:
+        print(f"   Using {len(tier1_ids)} Tier 1 comps for decay profile")
+    else:
+        print(f"   Tier 1 insufficient — using all {len(comps)} comps for decay profile")
+    decay_raw = classify_decay_risk(comp_ids_for_decay)
+    print(f"   Decay class: {decay_raw['decay_class']} | Flag: {decay_raw['timing_flag']}")
 
     # ── Section analysis ──────────────────────────────────────────
     section = run_section_analysis(event_id)
+
+    event_mode = detect_mode(info['Category_Name'])
 
     print(f"\n⏳ Generating recommendation...")
     rec = generate_recommendation(
@@ -2513,34 +3168,10 @@ def run_pipeline(event_id: int,
         current_price     = current_price,
         days_before_event = days_before,
         cost_basis        = cost_basis,
-        mode              = detect_mode(info['Category_Name']),
+        mode              = event_mode,
     )
 
-    # ── Reconcile decay timing_flag with actual rec position ──────────────
-    # classify_decay_risk only sees comp aggregates; it doesn't know whether
-    # the current price is already above the fitted peak for THIS event.
-    # Override HOLD_THROUGH_PEAK when the fitted trajectory shows no upside.
-    if decay and rec and decay.get('timing_flag') == 'HOLD_THROUGH_PEAK':
-        upside   = rec.get('upside_pct', 0)
-        day0_pct = rec.get('day0_pct', 0)
-        med_peak = decay.get('med_peak_uplift', 0)
-        if upside <= 0:
-            # Current price is at or above the fitted peak — holding adds no value
-            if day0_pct <= -10:
-                decay['timing_flag'] = 'SELL_EARLY_REQUIRED'
-                decay['guidance'] = (
-                    f"Comps historically peak ~{med_peak:.0f}% above baseline, but your "
-                    f"current price already reflects that premium. The fitted trajectory "
-                    f"shows {abs(day0_pct):.1f}% downside by event day — sell now to "
-                    f"capture current value rather than waiting for a peak that has passed."
-                )
-            else:
-                decay['timing_flag'] = 'SELL_ANYTIME'
-                decay['guidance'] = (
-                    f"Comps historically peak ~{med_peak:.0f}% above baseline, but your "
-                    f"current price is already at the forecast peak level. "
-                    f"Sell timing is flexible — no further material upside expected."
-                )
+    decay = reconcile_decay_with_rec(rec, decay_raw)
 
     print_report(info, comps, confidence, market, rec,
                  tc_share=tc_share,
@@ -2550,18 +3181,21 @@ def run_pipeline(event_id: int,
                  section=section)
 
     return {
-        'event_id':   event_id,
-        'info':       info,
-        'comps':      comps,
-        'confidence': confidence,
-        'market':     market,
-        'curves':     curves,
-        'rec':        rec,
-        'tc_share':   tc_share,
-        'demand':     demand,
-        'st_summary': st_summary,
-        'decay':      decay,
-        'section':    section,
+        'event_id':    event_id,
+        'info':        info,
+        'comps':       comps,
+        'confidence':  confidence,
+        'market':      market,
+        'curves':      curves,
+        'rec':         rec,
+        'tc_share':    tc_share,
+        'demand':      demand,
+        'st_summary':  st_summary,
+        'decay':       decay,
+        'decay_raw':   decay_raw,
+        'section':     section,
+        'event_mode':  event_mode,
+        'days_before': days_before,
     }
 # ================================================================== #
 #  ENTRY POINT                                                         #

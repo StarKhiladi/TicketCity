@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile scripts/main.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/frontend.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}
