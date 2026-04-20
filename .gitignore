@@ -1,11 +1,14 @@
 # Keep root docs
-# CLAUDE.md, README.md, requirements.txt stay tracked automatically unless ignored
+]
 
 # Ignore data
 data/
 
 # Ignore all scripts by default
 scripts/*
+
+.claude/
+CLAUDE.md
 
 # Allow only these
 !scripts/main.py
